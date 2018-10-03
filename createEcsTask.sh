@@ -27,13 +27,15 @@ function defineColorPalette() {
 # Handle user input
 function handleInput() {
   AWS_REGION="us-east-2"
+  CONTAINERS=()
   while [ "$#" -gt 0 ]; do
     case "$1" in
       # Required inputs
       --cluster) CLUSTER_NAME=$2; shift 2;;
+      --task-name) TASK_NAME="$2"; shift 2;;
       --region) AWS_REGION="$2"; shift 2;;
-      --container) CONTAINER="$2"; shift 2;;
       # Optional inputs yet to be implemented
+      --container) CONTAINERS+=("$2"); shift 2;;
       --skip-output) NO_OUTPUT=true; shift 1;;
       -h) HELP_WANTED=true; shift 1;;
       --help) HELP_WANTED=true; shift 1;;
@@ -64,4 +66,4 @@ handleInput "$@"
 defineColorPalette
 #createClusterIfItDoesNotExist
 #createAndRegisterNewInstanceIfNeeded
-./generateTaskDefinition.sh "$CONTAINER"
+./registerEcsTaskDefinition.sh "${CONTAINERS[*]}" "$TASK_NAME"
