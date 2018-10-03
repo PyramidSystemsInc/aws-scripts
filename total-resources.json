@@ -1,0 +1,26 @@
+[
+  {
+    "integerValue": 1024,
+    "longValue": 0,
+    "type": "INTEGER",
+    "name": "CPU",
+    "doubleValue": 0.0
+  },
+  {
+    "integerValue": 995,
+    "longValue": 0,
+    "type": "INTEGER",
+    "name": "MEMORY",
+    "doubleValue": 0.0
+  },
+  {
+    "name": "PORTS",
+    "longValue": 0,
+    "doubleValue": 0.0,
+    "stringSetValue": [
+      "22"
+    ],
+    "type": "STRINGSET",
+    "integerValue": 0
+  }
+]
