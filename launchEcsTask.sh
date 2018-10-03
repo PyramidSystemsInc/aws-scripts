@@ -66,4 +66,11 @@ handleInput "$@"
 defineColorPalette
 #createClusterIfItDoesNotExist
 #createAndRegisterNewInstanceIfNeeded
-./registerEcsTaskDefinition.sh "${CONTAINERS[*]}" "$TASK_NAME"
+./registerEcsTaskDefinition.sh "${CONTAINERS[*]}" "$TASK_NAME" "$CLUSTER_NAME"
+
+# 1. Return minimum instance required based on container resource inputs
+#NOTE: Done in registerEcsTaskDefinition.sh
+
+# 2. Check if any available instance can support the task being launched
+#aws ecs list-container-instances --cluster rispd-dev --region us-east-2
+#aws ecs describe-container-instances --cluster rispd-dev --container-instances 16e08e46-bfa0-4361-becf-012c7e513bfd --region us-east-2
