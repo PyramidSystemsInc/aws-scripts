@@ -1,5 +1,30 @@
 #! /bin/bash
 
+function handleInput() {
+  CPU_COEF=1024
+  MEMORY_COEF=995
+  TASK_NAME="$1"
+  buildContainersArray "$2"
+  AWS_REGION="$3"
+  parseAllDockerRunCommands "${CONTAINERS[@]}"
+}
+
+function buildContainersArray() {
+  CONTAINERS=()
+  RAW_CONTAINER_DATA=($1)
+  CONTAINER=""
+  for TERM in "${RAW_CONTAINER_DATA[@]}"; do
+    if [ "$TERM" == "docker" ]; then
+      CONTAINERS+=("$CONTAINER")
+      CONTAINER="$TERM"
+    else
+      CONTAINER="$CONTAINER"" $TERM"
+    fi
+  done
+  CONTAINERS+=("$CONTAINER")
+  unset 'CONTAINERS[0]'
+}
+
 # Break Docker run statement into individual variables
 function parseAllDockerRunCommands() {
   for CONTAINER in "${CONTAINERS[@]}"; do
@@ -38,7 +63,7 @@ function createTaskDefinitionJson() {
   for (( CONTAINER_INDEX=0; CONTAINER_INDEX<CONTAINER_COUNT; CONTAINER_INDEX++ )); do
     THIS_NAME="${NAME[$CONTAINER_INDEX]}"
     THIS_IMAGE="${IMAGE[$CONTAINER_INDEX]}"
-    THIS_CPU="$${CPU[$CONTAINER_INDEX]}"
+    THIS_CPU="${CPU[$CONTAINER_INDEX]}"
     THIS_MEMORY="${MEMORY[$CONTAINER_INDEX]}"
     if [ $CONTAINER_INDEX -eq 0 ]; then
 			TASK_DEFINITION="$TASK_DEFINITION"$(cat <<-EOF
@@ -74,102 +99,127 @@ function createTaskDefinitionJson() {
 		}
 	EOF
   )
-  echo "$TASK_DEFINITION"
+  echo $TASK_DEFINITION | jq '.'
 }
 
 function registerTaskDefinition() {
-  aws ecs register-task-definition --cli-input-json "$TASK_DEFINITION" >> /dev/null
+  aws ecs register-task-definition --cli-input-json "$TASK_DEFINITION" --region "$AWS_REGION" >> /dev/null
 }
 
-function buildContainersArray() {
-  CONTAINERS=()
-  RAW_CONTAINER_DATA=($1)
-  CONTAINER=""
-  for TERM in "${RAW_CONTAINER_DATA[@]}"; do
-    if [ "$TERM" == "docker" ]; then
-      CONTAINERS+=("$CONTAINER")
-      CONTAINER="$TERM"
+function validateDockerImages() {
+  IMAGE_COUNT=${#IMAGE[@]}
+  for (( IMAGE_INDEX=0; IMAGE_INDEX<IMAGE_COUNT; IMAGE_INDEX++ )); do
+    validateDockerImage
+  done
+}
+
+function validateDockerImage() {
+  THIS_IMAGE="${IMAGE[$IMAGE_INDEX]}"
+  splitImageIntoParts
+  if [ "$USER_SPECIFIED_ECR" == true ]; then
+    validateEcrDockerImage
+  else
+    validateLocalDockerOrDockerHubImage
+  fi
+}
+
+function validateLocalDockerOrDockerHubImage() {
+  DOCKER_IMAGES_EMPTY_OUTPUT_SIZE=84
+  IMAGE_EXISTS_LOCALLY=false
+  IMAGE_EXISTS_ON_DOCKER_HUB=false
+  LOCAL_DOCKER_IMAGES=$(docker images "$THIS_IMAGE")
+  if [ ! "${#LOCAL_DOCKER_IMAGES}" -eq $DOCKER_IMAGES_EMPTY_OUTPUT_SIZE ]; then
+    IMAGE_EXISTS_LOCALLY=true
+  fi
+  if [ "$IMAGE_EXISTS_LOCALLY" == true ]; then
+    exitIfEcrImageTagComboAlreadyExists
+    if [ "$REPO_EXISTS_IN_ECR" == false ]; then
+      $(aws ecr get-login --no-include-email --region "$AWS_REGION" >> /dev/null)
+      ECR_REPOSITORY_URI=$(sed -e 's/^"//' -e 's/"$//' <<< $(aws ecr create-repository --repository-name "$THIS_IMAGE_NAME" --region "$AWS_REGION" | jq '.repository.repositoryUri'))
     else
-      CONTAINER="$CONTAINER"" $TERM"
+      ECR_REPOSITORY_URI=$(sed -e 's/^"//' -e 's/"$//' <<< $(aws ecr describe-repositories --repository "$THIS_IMAGE_NAME" --region "$AWS_REGION" | jq '.repositories[0].repositoryUri'))
+    fi
+    THIS_IMAGE_ECR="$ECR_REPOSITORY_URI":"$THIS_IMAGE_TAG"
+    docker tag "$THIS_IMAGE" "$THIS_IMAGE_ECR"
+    docker push "$THIS_IMAGE_ECR" >> /dev/null
+    IMAGE[$IMAGE_INDEX]="$THIS_IMAGE_ECR"
+  else
+    # TODO: Check if image exists on Docker Hub
+    echo Image does not exist locally
+  fi
+}
+
+function splitImageIntoParts() {
+  if [[ "$THIS_IMAGE" =~ ^.*:.*$ ]]; then
+    THIS_IMAGE_NAME="${THIS_IMAGE%:*}"
+    THIS_IMAGE_TAG="${THIS_IMAGE#*:}"
+  else
+    THIS_IMAGE_NAME="$THIS_IMAGE"
+    THIS_IMAGE_TAG="latest"
+    THIS_IMAGE="$THIS_IMAGE_NAME"":""$THIS_IMAGE_TAG"
+  fi
+  USER_SPECIFIED_ECR=false
+  if [[ "$THIS_IMAGE" =~ ^ecr/.* ]]; then
+    USER_SPECIFIED_ECR=true
+  fi
+}
+
+function exitIfEcrImageTagComboAlreadyExists() {
+  REPO_EXISTS_IN_ECR=false
+  ECR_REPOS=$(aws ecr describe-repositories --region "$AWS_REGION" | jq '.repositories')
+  ECR_REPO_COUNT=$(echo "$ECR_REPOS" | jq '. | length')
+  for (( ECR_REPO_INDEX=0; ECR_REPO_INDEX<ECR_REPO_COUNT; ECR_REPO_INDEX++ )); do
+    THIS_ECR_REPO=$(echo "$ECR_REPOS" | jq '.['"$ECR_REPO_INDEX"']')
+    THIS_ECR_REPO_NAME=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo "$THIS_ECR_REPO" | jq '.repositoryName'))
+    if [ "$THIS_ECR_REPO_NAME" == "$THIS_IMAGE_NAME" ]; then
+      REPO_EXISTS_IN_ECR=true
+      ECR_IMAGES=$(aws ecr list-images --repository-name "$THIS_ECR_REPO_NAME" --region "$AWS_REGION" | jq '.imageIds')
+      ECR_IMAGE_COUNT=$(echo "$ECR_IMAGES" | jq '. | length')
+      for (( ECR_IMAGE_INDEX=0; ECR_IMAGE_INDEX<ECR_IMAGE_COUNT; ECR_IMAGE_INDEX++ )); do
+        ECR_IMAGE_TAG=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo "$ECR_IMAGES" | jq '.['"$ECR_IMAGE_INDEX"'].imageTag'))
+        if [ ! $ECR_IMAGE_TAG == null ]; then
+          if [ "$ECR_IMAGE_TAG" == "$THIS_IMAGE_TAG" ]; then
+            echo "ERROR: The image ""$THIS_IMAGE"" already exists in ECR. The task creation was abandoned because creating it would require overwriting the image in ECR. If you wish to use the image in ecr, run the image ecr/""$THIS_IMAGE"". If you want to use your local image, retag it using 'docker tag ""$THIS_IMAGE"" ""$THIS_IMAGE_NAME"":<new-tag-here>'"
+            exit 2
+          fi
+        fi
+      done
     fi
   done
-  CONTAINERS+=("$CONTAINER")
-  unset 'CONTAINERS[0]'
 }
 
-AWS_REGION='us-east-2'
-CPU_COEF=1024
-MEMORY_COEF=995
-TASK_NAME="$2"
-CLUSTER_NAME="$3"
-buildContainersArray "$1"
-parseAllDockerRunCommands "${CONTAINERS[@]}"
-#createTaskDefinitionJson
-#registerTaskDefinition
+function validateEcrDockerImage() {
+  IMAGE_EXISTS_IN_ECR=false
+  ECR_REPOS=$(aws ecr describe-repositories --region "$AWS_REGION" | jq '.repositories')
+  ECR_REPO_COUNT=$(echo "$ECR_REPOS" | jq '. | length')
+  THIS_IMAGE_NAME=$(echo -n "$THIS_IMAGE_NAME" | tail -c +5)
+  for (( ECR_REPO_INDEX=0; ECR_REPO_INDEX<ECR_REPO_COUNT; ECR_REPO_INDEX++ )); do
+    THIS_ECR_REPO=$(echo "$ECR_REPOS" | jq '.['"$ECR_REPO_INDEX"']')
+    THIS_ECR_REPO_NAME=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo "$THIS_ECR_REPO" | jq '.repositoryName'))
+    if [ "$THIS_ECR_REPO_NAME" == "$THIS_IMAGE_NAME" ]; then
+      REPO_EXISTS_IN_ECR=true
+      ECR_IMAGES=$(aws ecr list-images --repository-name "$THIS_ECR_REPO_NAME" --region "$AWS_REGION" | jq '.imageIds')
+      ECR_IMAGE_COUNT=$(echo "$ECR_IMAGES" | jq '. | length')
+      for (( ECR_IMAGE_INDEX=0; ECR_IMAGE_INDEX<ECR_IMAGE_COUNT; ECR_IMAGE_INDEX++ )); do
+        ECR_IMAGE_TAG=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo "$ECR_IMAGES" | jq '.['"$ECR_IMAGE_INDEX"'].imageTag'))
+        if [ ! $ECR_IMAGE_TAG == null ]; then
+          if [ "$ECR_IMAGE_TAG" == "$THIS_IMAGE_TAG" ]; then
+            IMAGE_EXISTS_IN_ECR=true
+            THIS_ECR_REPO_URI=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo "$THIS_ECR_REPO" | jq '.repositoryUri'))
+            IMAGE[$IMAGE_INDEX]="$THIS_ECR_REPO_URI":"$THIS_IMAGE_TAG"
+            break
+          fi
+        fi
+      done
+    fi
+  done
+  if [ "$IMAGE_EXISTS_IN_ECR" == false ]; then
+    echo "ERROR: The image ""$THIS_IMAGE"" could not be found in ECR. Are you using the correct AWS account and region? Are you using the correct tag?"
+    exit 2
+  fi
+}
 
-declare -A AWS_T3_INSTANCE_SPEC0=(
-  [name]='t3.nano'
-  [cpu]=2048
-  [memory]=497
-)
-declare -A AWS_T3_INSTANCE_SPEC1=(
-  [name]='t3.micro'
-  [cpu]=2048
-  [memory]=995
-)
-declare -A AWS_T3_INSTANCE_SPEC2=(
-  [name]='t3.small'
-  [cpu]=2048
-  [memory]=1990
-)
-declare -A AWS_T3_INSTANCE_SPEC3=(
-  [name]='t3.medium'
-  [cpu]=2048
-  [memory]=3980
-)
-declare -A AWS_T3_INSTANCE_SPEC4=(
-  [name]='t3.large'
-  [cpu]=2048
-  [memory]=7960
-)
-declare -A AWS_T3_INSTANCE_SPEC5=(
-  [name]='t3.xlarge'
-  [cpu]=4096
-  [memory]=15920
-)
-declare -A AWS_T3_INSTANCE_SPEC6=(
-  [name]='t3.2xlarge'
-  [cpu]=8192
-  [memory]=31840
-)
-declare -n AWS_T3_INSTANCE_SPEC
-
-#for AWS_T3_INSTANCE_SPEC in ${!AWS_T3_INSTANCE_SPEC@}; do
-#  echo ${AWS_T3_INSTANCE_SPEC[name]}
-#  echo ${AWS_T3_INSTANCE_SPEC[cpu]}
-#  echo ${AWS_T3_INSTANCE_SPEC[memory]}
-#  echo -e ""
-#done
-
-CPU_REQUIREMENT=0
-for CPU_VALUE in "${CPU[@]}"; do
-  CPU_REQUIREMENT=$(($CPU_REQUIREMENT + $CPU_VALUE))
-done
-MEMORY_REQUIREMENT=0
-for MEMORY_VALUE in "${MEMORY[@]}"; do
-  MEMORY_REQUIREMENT=$(($MEMORY_REQUIREMENT + $MEMORY_VALUE))
-done
-
-# 1a. Check if any current instance can handle the requirement
-#   If so, continue
-#   If not, find the minimum t3 size instance that would handle the requirement
-
-CONTAINER_INSTANCE_ARNS=$(aws ecs list-container-instances --cluster "$CLUSTER_NAME" --region "$AWS_REGION" | jq '.containerInstanceArns')
-INSTANCE_COUNT=$(echo $CONTAINER_INSTANCE_ARNS | jq '. | length')
-for (( INSTANCE_INDEX=0; INSTANCE_INDEX<INSTANCE_COUNT; INSTANCE_INDEX++ )); do
-  THIS_INSTANCE_ARN=$(echo "$CONTAINER_INSTANCE_ARNS" | jq '.['"$INSTANCE_INDEX"']')
-  echo "$CLUSTER_NAME"
-  echo "$THIS_INSTANCE_ARN"
-  echo "$AWS_REGION"
-  #aws ecs describe-container-instances --cluster "$CLUSTER_NAME" --container-instances "$THIS_INSTANCE_ARN" --region "$AWS_REGION"
-done
+handleInput "$@"
+validateDockerImages
+createTaskDefinitionJson
+registerTaskDefinition

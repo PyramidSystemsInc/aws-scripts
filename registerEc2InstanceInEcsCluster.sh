@@ -3,7 +3,6 @@
 # Create ECS cluster
 function createCluster() {
   aws ecs create-cluster --cluster-name "$CLUSTER_NAME" --region "$AWS_REGION" >> /dev/null
-  echo "STEPS_COMPLETED[1]=true" | sudo tee --append /configurationProgress.sh >> /dev/null
 }
 
 # Define all colors used for output
@@ -20,6 +19,7 @@ function handleInput() {
     case "$1" in
       # Required inputs
       --instance-name) INSTANCE_NAME="$2"; shift 2;;
+      --instance-type) INSTANCE_TYPE="$2"; shift 2;;
       --cluster) CLUSTER_NAME=$2; shift 2;;
       # Optional inputs yet to be implemented
       --region) AWS_REGION="$2"; shift 2;;
@@ -56,10 +56,44 @@ function findInstanceIpAddress() {
   fi
 }
 
+function findInstanceResources() {
+  . ./awsT3InstanceSpecs.sh
+  for AWS_T3_INSTANCE_SPEC in ${!AWS_T3_INSTANCE_SPEC@}; do
+    if [ ${AWS_T3_INSTANCE_SPEC[name]} == $INSTANCE_TYPE ]; then
+      INSTANCE_CPU=${AWS_T3_INSTANCE_SPEC[cpu]}
+      INSTANCE_MEMORY=${AWS_T3_INSTANCE_SPEC[memory]}
+      break
+    fi
+  done
+}
+
 function getIdentityInformation() {
   IDENTITY_DOCUMENT=$(ssh -i ~/Desktop/"$INSTANCE_NAME".pem ec2-user@"$INSTANCE_PUBLIC_IP" 'echo "" | sudo -Sv && bash -s' < ./getIdentityDocument.sh)
   IDENTITY_SIGNATURE=$(ssh -i ~/Desktop/"$INSTANCE_NAME".pem ec2-user@"$INSTANCE_PUBLIC_IP" 'echo "" | sudo -Sv && bash -s' < ./getIdentitySignature.sh)
-  RESOURCES=$(cat total-resources.json)
+}
+
+function createResourceInformationJson() {
+  # TODO: Must add in other resources such as ports
+  #RESOURCES=$(cat total-resources.json)
+	RESOURCES=$(cat <<-EOF
+		[
+		  {
+		    "integerValue": $INSTANCE_CPU,
+		    "longValue": 0,
+		    "type": "INTEGER",
+		    "name": "CPU",
+		    "doubleValue": 0.0
+		  },
+		  {
+		    "integerValue": $INSTANCE_MEMORY,
+		    "longValue": 0,
+		    "type": "INTEGER",
+		    "name": "MEMORY",
+		    "doubleValue": 0.0
+		  }
+		]
+	EOF
+	)
 }
 
 function registerInstanceWithCluster() {
@@ -69,5 +103,7 @@ function registerInstanceWithCluster() {
 handleInput "$@"
 defineColorPalette
 findInstanceIpAddress
+findInstanceResources
 getIdentityInformation
+createResourceInformationJson
 registerInstanceWithCluster

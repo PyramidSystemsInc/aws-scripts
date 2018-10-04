@@ -32,7 +32,7 @@ function handleInput() {
     case "$1" in
       # Required inputs
       --cluster) CLUSTER_NAME=$2; shift 2;;
-      --task-name) TASK_NAME="$2"; shift 2;;
+      --task) TASK_NAME="$2"; shift 2;;
       --region) AWS_REGION="$2"; shift 2;;
       # Optional inputs yet to be implemented
       --container) CONTAINERS+=("$2"); shift 2;;
@@ -47,30 +47,122 @@ function handleInput() {
     echo -e "${COLOR_WHITE_BOLD}NOTICE: The following arguments were ignored: ${args}"
     echo -e "${COLOR_NONE}"
   fi
+  parseAllDockerRunCommands
+}
+
+# Break Docker run statement into individual variables
+function parseAllDockerRunCommands() {
+  for CONTAINER in "${CONTAINERS[@]}"; do
+    parseDockerRunCommand $CONTAINER
+  done
+}
+
+function parseDockerRunCommand() {
+  ARGS=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --name) NAME+=("$2"); shift 2;;
+      --cpu) CPU+=($(($2 * $CPU_COEF))); shift 2;;
+      --memory) MEM=$(echo "scale=0; (($2 * $MEMORY_COEF) / 1)" | bc); MEMORY+=("$MEM"); shift 2;;
+      docker) shift 1;;
+      run) shift 1;;
+      -*) echo "unknown option: $1" >&2; exit 1;;
+      *) ARGS+=("$1"); shift 1;;
+    esac
+  done
+  for ARG in "${ARGS[@]}"; do
+    if [ -n "$ARG" ]; then
+      IMAGE+=("$ARG")
+    fi
+  done
 }
 
 function createAndRegisterNewInstanceIfNeeded() {
-  CLUSTER_STATUS=$(aws ecs describe-clusters --clusters "$CLUSTER_NAME" | jq '.clusters[0]')
-  CLUSTER_INSTANCE_COUNT=$(echo "$CLUSTER_STATUS" | jq '.registeredContainerInstancesCount')
-  CLUSTER_PENDING_TASKS_COUNT=$(echo "$CLUSTER_STATUS" | jq '.pendingTasksCount')
-  CLUSTER_RUNNING_TASKS_COUNT=$(echo "$CLUSTER_STATUS" | jq '.runningTasksCount')
-  if [ $(($CLUSTER_PENDING_TASKS_COUNT + $CLUSTER_RUNNING_TASKS_COUNT)) -ge $CLUSTER_INSTANCE_COUNT ]; then
+  if [ "$INSTANCE_SUITS_TASK" == false ]; then
+    CLUSTER_STATUS=$(aws ecs describe-clusters --clusters "$CLUSTER_NAME" | jq '.clusters[0]')
+    CLUSTER_INSTANCE_COUNT=$(echo "$CLUSTER_STATUS" | jq '.registeredContainerInstancesCount')
     NEXT_CLUSTER_INDEX=$(($CLUSTER_INSTANCE_COUNT + 1))
+    # TODO: Ensure name is unique
     NEW_INSTANCE_NAME=ecs-"$CLUSTER_NAME"-"$NEXT_CLUSTER_INDEX"
-    ./createEc2Instance.sh --name "$NEW_INSTANCE_NAME" --image ami-40142d25 --type t3.micro --port 22 --wait-for-init
-    ./registerEc2InstanceInEcsCluster.sh --cluster "$CLUSTER_NAME" --instance-name "$NEW_INSTANCE_NAME"
+    # TODO: Do SSH polling in createEc2Instance.sh to remove --wait-for-init
+    ./createEc2Instance.sh --name "$NEW_INSTANCE_NAME" --image "$AWS_EC2_AMI" --type "$MINIMUM_SUITABLE_INSTANCE_TYPE" --port 22 --wait-for-init
+    ./registerEc2InstanceInEcsCluster.sh --cluster "$CLUSTER_NAME" --instance-name "$NEW_INSTANCE_NAME" --instance-type "$MINIMUM_SUITABLE_INSTANCE_TYPE"
   fi
 }
 
+function declareConstants() {
+  CPU_COEF=1024
+  MEMORY_COEF=995
+  AWS_EC2_AMI="ami-40142d25"
+}
+
+function calculateSumResourceRequirementsForTask() {
+  CPU_REQUIREMENT=0
+  for CPU_VALUE in "${CPU[@]}"; do
+    CPU_REQUIREMENT=$(($CPU_REQUIREMENT + $CPU_VALUE))
+  done
+  MEMORY_REQUIREMENT=0
+  for MEMORY_VALUE in "${MEMORY[@]}"; do
+    MEMORY_REQUIREMENT=$(($MEMORY_REQUIREMENT + $MEMORY_VALUE))
+  done
+}
+
+function findExistingSuitableInstanceInCluster() {
+  INSTANCE_SUITS_TASK=false
+  CONTAINER_INSTANCE_ARNS=$(aws ecs list-container-instances --cluster "$CLUSTER_NAME" --region "$AWS_REGION" | jq '.containerInstanceArns')
+  INSTANCE_COUNT=$(echo $CONTAINER_INSTANCE_ARNS | jq '. | length')
+  for (( INSTANCE_INDEX=0; INSTANCE_INDEX<INSTANCE_COUNT; INSTANCE_INDEX++ )); do
+    THIS_INSTANCE_ARN=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo "$CONTAINER_INSTANCE_ARNS" | jq '.['"$INSTANCE_INDEX"']'))
+    findRemainingResourcesOnInstance
+    checkIfInstanceSuitsTask
+  done
+}
+
+function findRemainingResourcesOnInstance() {
+  RESOURCES=$(aws ecs describe-container-instances --cluster "$CLUSTER_NAME" --container-instances "$THIS_INSTANCE_ARN" --region "$AWS_REGION" | jq '.containerInstances[0].remainingResources')
+  RESOURCE_COUNT=$(echo "$RESOURCES" | jq '. | length')
+  for (( RESOURCE_INDEX=0; RESOURCE_INDEX<RESOURCE_COUNT; RESOURCE_INDEX++ )); do
+    THIS_RESOURCE=$(echo "$RESOURCES" | jq '.['"$RESOURCE_INDEX"']')
+    THIS_RESOURCE_NAME=$(echo "$THIS_RESOURCE" | jq '.name')
+    if [ "$THIS_RESOURCE_NAME" == \"CPU\" ]; then
+      THIS_INSTANCE_CPU_REMAINING=$(echo "$THIS_RESOURCE" | jq '.integerValue')
+    elif [ "$THIS_RESOURCE_NAME" == \"MEMORY\" ]; then
+      THIS_INSTANCE_MEMORY_REMAINING=$(echo "$THIS_RESOURCE" | jq '.integerValue')
+    fi
+  done
+}
+
+function checkIfInstanceSuitsTask() {
+  if [ $THIS_INSTANCE_CPU_REMAINING -ge $CPU_REQUIREMENT ] && [ $THIS_INSTANCE_MEMORY_REMAINING -ge $MEMORY_REQUIREMENT ]; then
+    INSTANCE_SUITS_TASK="$THIS_INSTANCE_ARN"
+    break
+  fi
+}
+
+function getMinimumSuitableInstanceType() {
+  . ./awsT3InstanceSpecs.sh
+  MINIMUM_SUITABLE_INSTANCE_TYPE=false
+  if [ "$INSTANCE_SUITS_TASK" == false ]; then
+    for AWS_T3_INSTANCE_SPEC in ${!AWS_T3_INSTANCE_SPEC@}; do
+      if [ ${AWS_T3_INSTANCE_SPEC[cpu]} -ge $CPU_REQUIREMENT ] && [ ${AWS_T3_INSTANCE_SPEC[memory]} -ge $MEMORY_REQUIREMENT ]; then
+        MINIMUM_SUITABLE_INSTANCE_TYPE=${AWS_T3_INSTANCE_SPEC[name]}
+        break
+      fi
+    done
+  fi
+}
+
+function registerEcsTaskDefinition() {
+  ./registerEcsTaskDefinition.sh "$TASK_NAME" "${CONTAINERS[*]}" "$AWS_REGION"
+}
+
+declareConstants
 handleInput "$@"
 defineColorPalette
-#createClusterIfItDoesNotExist
-#createAndRegisterNewInstanceIfNeeded
-./registerEcsTaskDefinition.sh "${CONTAINERS[*]}" "$TASK_NAME" "$CLUSTER_NAME"
-
-# 1. Return minimum instance required based on container resource inputs
-#NOTE: Done in registerEcsTaskDefinition.sh
-
-# 2. Check if any available instance can support the task being launched
-#aws ecs list-container-instances --cluster rispd-dev --region us-east-2
-#aws ecs describe-container-instances --cluster rispd-dev --container-instances 16e08e46-bfa0-4361-becf-012c7e513bfd --region us-east-2
+createClusterIfItDoesNotExist
+calculateSumResourceRequirementsForTask
+findExistingSuitableInstanceInCluster
+getMinimumSuitableInstanceType
+createAndRegisterNewInstanceIfNeeded
+registerEcsTaskDefinition
+#launchTask
