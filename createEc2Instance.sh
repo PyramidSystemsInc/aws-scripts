@@ -154,6 +154,10 @@ function waitUntilInstanceInitialized() {
   fi
 }
 
+function waitUntilInstanceRunning() {
+  aws ec2 wait instance-running --instance-ids "$INSTANCE_ID" --region "$AWS_REGION"
+}
+
 handleInput "$@"
 defineColorPalette
 #defineExpectedProgress
@@ -162,6 +166,7 @@ createSecurityGroup
 createKeyPair
 createInstance
 changeInstanceName
+waitUntilInstanceRunning
 waitUntilInstanceInitialized
 #sleep 3; if pgrep $MONITOR_PROGRESS_PID; then pkill $MONITOR_PROGRESS_PID; fi
 printAdditionalInformation

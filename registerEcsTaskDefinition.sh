@@ -2,7 +2,7 @@
 
 function handleInput() {
   CPU_COEF=1024
-  MEMORY_COEF=995
+  MEMORY_COEF=926
   TASK_NAME="$1"
   buildContainersArray "$2"
   AWS_REGION="$3"
@@ -107,6 +107,7 @@ function registerTaskDefinition() {
 }
 
 function validateDockerImages() {
+  $(aws ecr get-login --no-include-email --region us-east-2) >/dev/null 2>/dev/null
   IMAGE_COUNT=${#IMAGE[@]}
   for (( IMAGE_INDEX=0; IMAGE_INDEX<IMAGE_COUNT; IMAGE_INDEX++ )); do
     validateDockerImage
@@ -134,7 +135,6 @@ function validateLocalDockerOrDockerHubImage() {
   if [ "$IMAGE_EXISTS_LOCALLY" == true ]; then
     exitIfEcrImageTagComboAlreadyExists
     if [ "$REPO_EXISTS_IN_ECR" == false ]; then
-      $(aws ecr get-login --no-include-email --region "$AWS_REGION" >> /dev/null)
       ECR_REPOSITORY_URI=$(sed -e 's/^"//' -e 's/"$//' <<< $(aws ecr create-repository --repository-name "$THIS_IMAGE_NAME" --region "$AWS_REGION" | jq '.repository.repositoryUri'))
     else
       ECR_REPOSITORY_URI=$(sed -e 's/^"//' -e 's/"$//' <<< $(aws ecr describe-repositories --repository "$THIS_IMAGE_NAME" --region "$AWS_REGION" | jq '.repositories[0].repositoryUri'))

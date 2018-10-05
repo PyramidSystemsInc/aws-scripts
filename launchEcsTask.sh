@@ -13,6 +13,7 @@ function createClusterIfItDoesNotExist() {
   done
   if [ "$CLUSTER_EXISTS" == "false" ]; then
     ./createEcsCluster.sh --name "$CLUSTER_NAME" --region "$AWS_REGION"
+    exitIfScriptFailed
     echo $INSTANCE_PUBLIC_IP
   fi
 }
@@ -84,16 +85,49 @@ function createAndRegisterNewInstanceIfNeeded() {
     NEXT_CLUSTER_INDEX=$(($CLUSTER_INSTANCE_COUNT + 1))
     # TODO: Ensure name is unique
     NEW_INSTANCE_NAME=ecs-"$CLUSTER_NAME"-"$NEXT_CLUSTER_INDEX"
-    # TODO: Do SSH polling in createEc2Instance.sh to remove --wait-for-init
-    ./createEc2Instance.sh --name "$NEW_INSTANCE_NAME" --image "$AWS_EC2_AMI" --type "$MINIMUM_SUITABLE_INSTANCE_TYPE" --port 22 --wait-for-init
-    ./registerEc2InstanceInEcsCluster.sh --cluster "$CLUSTER_NAME" --instance-name "$NEW_INSTANCE_NAME" --instance-type "$MINIMUM_SUITABLE_INSTANCE_TYPE"
+    ./createEc2Instance.sh --name "$NEW_INSTANCE_NAME" --image "$AWS_EC2_AMI" --type "$MINIMUM_SUITABLE_INSTANCE_TYPE" --iam-role jenkins_instance --port 22 --startup-script installEcsAgentOnEc2Instance.sh
+    exitIfScriptFailed
+    findNewInstanceInformation
+    waitUntilInstanceRegisteredInCluster
+  fi
+}
+
+function waitUntilInstanceRegisteredInCluster() {
+  # Query some aws ecs command until the instance id appears in cluster
+  # aws ecs list-container-instances --cluster sample
+    # NOTE: Only GUID of ARN allowed in the following query
+  # In a for loop:
+    #sed -e 's/^"//' -e 's/"$//' <<< $(aws ecs describe-container-instances --cluster sample --container-instances 04e80d69-0419-4dfb-a66c-b3ea3cb62c52 62eaaac5-d4c4-4421-aba8-f33d3ca1f224 87859dc0-1213-4099-bfc8-08c8c3f95190 98aa3d82-8702-4802-b040-076631688d4e | jq '.containerInstances[0].ec2InstanceId')
+}
+
+function findNewInstanceInformation() {
+  EC2_INSTANCES=$(aws ec2 describe-instances --query 'Reservations[*].Instances[*].[State.Name,Tags[?Key==`Name`].Value,PublicIpAddress,InstanceId]')
+  INSTANCE_COUNT=$(echo $EC2_INSTANCES | jq '. | length')
+  for (( INSTANCE_INDEX=0; INSTANCE_INDEX<INSTANCE_COUNT; INSTANCE_INDEX++ )); do
+    THIS_INSTANCE=$(echo $EC2_INSTANCES | jq '.['"$INSTANCE_INDEX"'][0]')
+    THIS_INSTANCE_STATE=$(echo $THIS_INSTANCE | jq '.[0]')
+    THIS_INSTANCE_NAME=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo $THIS_INSTANCE | jq '.[1][0]'))
+    if [ "$THIS_INSTANCE_STATE" == \"running\" ] && [ "$THIS_INSTANCE_NAME" == "$NEW_INSTANCE_NAME" ]; then
+      THIS_INSTANCE_IP=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo $THIS_INSTANCE | jq '.[2]'))
+      THIS_INSTANCE_ID=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo $THIS_INSTANCE | jq '.[3]'))
+      break
+    fi
+  done
+  if [ -z "$THIS_INSTANCE_IP" ]; then
+    echo -e "${COLOR_RED_BOLD}ERROR: The instance could not be found"
+    echo -e "${COLOR_NONE}"
+    exit 2
+  else
+    NEW_INSTANCE_PUBLIC_IP=$THIS_INSTANCE_IP
+    NEW_INSTANCE_PUBLIC_ID=$THIS_INSTANCE_ID
   fi
 }
 
 function declareConstants() {
   CPU_COEF=1024
-  MEMORY_COEF=995
+  MEMORY_COEF=926
   AWS_EC2_AMI="ami-40142d25"
+  #AWS_EC2_AMI="ami-09a64272e7fe706b6"
 }
 
 function calculateSumResourceRequirementsForTask() {
@@ -154,6 +188,18 @@ function getMinimumSuitableInstanceType() {
 
 function registerEcsTaskDefinition() {
   ./registerEcsTaskDefinition.sh "$TASK_NAME" "${CONTAINERS[*]}" "$AWS_REGION"
+  exitIfScriptFailed
+}
+
+function launchTask() {
+  sleep 10
+  aws ecs run-task --cluster "$CLUSTER_NAME" --task-definition "$TASK_NAME" --region "$AWS_REGION"
+}
+
+function exitIfScriptFailed() {
+  if [ $? -eq 2 ]; then
+    exit 2
+  fi
 }
 
 declareConstants
@@ -165,4 +211,4 @@ findExistingSuitableInstanceInCluster
 getMinimumSuitableInstanceType
 createAndRegisterNewInstanceIfNeeded
 registerEcsTaskDefinition
-#launchTask
+launchTask
