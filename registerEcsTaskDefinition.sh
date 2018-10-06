@@ -5,7 +5,8 @@ function handleInput() {
   MEMORY_COEF=926
   TASK_NAME="$1"
   buildContainersArray "$2"
-  AWS_REGION="$3"
+  OVERWRITE_ECR="$3"
+  AWS_REGION="$4"
   parseAllDockerRunCommands "${CONTAINERS[@]}"
 }
 
@@ -99,7 +100,6 @@ function createTaskDefinitionJson() {
 		}
 	EOF
   )
-  echo $TASK_DEFINITION | jq '.'
 }
 
 function registerTaskDefinition() {
@@ -133,7 +133,9 @@ function validateLocalDockerOrDockerHubImage() {
     IMAGE_EXISTS_LOCALLY=true
   fi
   if [ "$IMAGE_EXISTS_LOCALLY" == true ]; then
-    exitIfEcrImageTagComboAlreadyExists
+    if [ "$OVERWRITE_ECR" == false ]; then
+      exitIfEcrImageTagComboAlreadyExists
+    fi
     if [ "$REPO_EXISTS_IN_ECR" == false ]; then
       ECR_REPOSITORY_URI=$(sed -e 's/^"//' -e 's/"$//' <<< $(aws ecr create-repository --repository-name "$THIS_IMAGE_NAME" --region "$AWS_REGION" | jq '.repository.repositoryUri'))
     else
@@ -179,7 +181,7 @@ function exitIfEcrImageTagComboAlreadyExists() {
         ECR_IMAGE_TAG=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo "$ECR_IMAGES" | jq '.['"$ECR_IMAGE_INDEX"'].imageTag'))
         if [ ! $ECR_IMAGE_TAG == null ]; then
           if [ "$ECR_IMAGE_TAG" == "$THIS_IMAGE_TAG" ]; then
-            echo "ERROR: The image ""$THIS_IMAGE"" already exists in ECR. The task creation was abandoned because creating it would require overwriting the image in ECR. If you wish to use the image in ecr, run the image ecr/""$THIS_IMAGE"". If you want to use your local image, retag it using 'docker tag ""$THIS_IMAGE"" ""$THIS_IMAGE_NAME"":<new-tag-here>'"
+            echo "ERROR: The image ""$THIS_IMAGE"" already exists in ECR. The task creation was abandoned because creating it would require overwriting the image in ECR. If you wish to use the image in ECR, run the image ecr/""$THIS_IMAGE"". If you want to use your local image, either retag it using 'docker tag ""$THIS_IMAGE"" ""$THIS_IMAGE_NAME"":<new-tag-here>' or re-run your command with the '--overwrite-ecr' flag"
             exit 2
           fi
         fi

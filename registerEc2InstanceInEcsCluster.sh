@@ -74,7 +74,6 @@ function getIdentityInformation() {
 
 function createResourceInformationJson() {
   # TODO: Must add in other resources such as ports
-  #RESOURCES=$(cat total-resources.json)
 	RESOURCES=$(cat <<-EOF
 		[
 		  {

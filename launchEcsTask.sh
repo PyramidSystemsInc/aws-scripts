@@ -14,7 +14,6 @@ function createClusterIfItDoesNotExist() {
   if [ "$CLUSTER_EXISTS" == "false" ]; then
     ./createEcsCluster.sh --name "$CLUSTER_NAME" --region "$AWS_REGION"
     exitIfScriptFailed
-    echo $INSTANCE_PUBLIC_IP
   fi
 }
 
@@ -28,15 +27,21 @@ function defineColorPalette() {
 # Handle user input
 function handleInput() {
   AWS_REGION="us-east-2"
+  OVERWRITE_ECR=false
+  REVISION="hasnotbeenset"
   CONTAINERS=()
   while [ "$#" -gt 0 ]; do
     case "$1" in
       # Required inputs
       --cluster) CLUSTER_NAME=$2; shift 2;;
       --task) TASK_NAME="$2"; shift 2;;
+      # One, and only one, of the following inputs is required
+      --container) CONTAINERS+=("$2"); shift 2;;
+      --revision) REVISION=("$2"); shift 2;;
+      # Optional inputs
+      --overwrite-ecr) OVERWRITE_ECR=true; shift 1;;
       --region) AWS_REGION="$2"; shift 2;;
       # Optional inputs yet to be implemented
-      --container) CONTAINERS+=("$2"); shift 2;;
       --skip-output) NO_OUTPUT=true; shift 1;;
       -h) HELP_WANTED=true; shift 1;;
       --help) HELP_WANTED=true; shift 1;;
@@ -48,7 +53,18 @@ function handleInput() {
     echo -e "${COLOR_WHITE_BOLD}NOTICE: The following arguments were ignored: ${args}"
     echo -e "${COLOR_NONE}"
   fi
-  parseAllDockerRunCommands
+  if [ "${#CONTAINERS}" -eq 0 ]; then
+    REGISTERING_NEW_TASK_DEFINITION=false
+    if [ "$REVISION" == "hasnotbeenset" ]; then
+      REVISION="latest"
+    fi
+    gatherTaskDefinitionResourcesRequired
+  elif [ "${#CONTAINERS}" -ge 1 ] && [ "$REVISION" == "hasnotbeenset" ]; then
+    REGISTERING_NEW_TASK_DEFINITION=true
+    parseAllDockerRunCommands
+  else
+    echo "ERROR: Only one of the following flags should be used: One or more '--container <DOCKER RUN COMMAND>' flags to register a new task definition -OR- a single '--revision <NUMBER>' flag in order to run an existing task definition. Omitting both tags assumes you want to use an existing task defintion and the latest revision of that task"
+  fi
 }
 
 # Break Docker run statement into individual variables
@@ -93,11 +109,18 @@ function createAndRegisterNewInstanceIfNeeded() {
 }
 
 function waitUntilInstanceRegisteredInCluster() {
-  # Query some aws ecs command until the instance id appears in cluster
-  # aws ecs list-container-instances --cluster sample
-    # NOTE: Only GUID of ARN allowed in the following query
-  # In a for loop:
-    #sed -e 's/^"//' -e 's/"$//' <<< $(aws ecs describe-container-instances --cluster sample --container-instances 04e80d69-0419-4dfb-a66c-b3ea3cb62c52 62eaaac5-d4c4-4421-aba8-f33d3ca1f224 87859dc0-1213-4099-bfc8-08c8c3f95190 98aa3d82-8702-4802-b040-076631688d4e | jq '.containerInstances[0].ec2InstanceId')
+  while : ; do
+    CLUSTER_INSTANCES=$(aws ecs list-container-instances --cluster sample --region us-east-2 | jq '.containerInstanceArns')
+    CLUSTER_INSTANCE_COUNT=$(echo $CLUSTER_INSTANCES | jq '. | length')
+    for (( CLUSTER_INSTANCE_INDEX=0; CLUSTER_INSTANCE_INDEX<CLUSTER_INSTANCE_COUNT; CLUSTER_INSTANCE_INDEX++ )); do
+      CLUSTER_INSTANCE_ID=$(sed -e 's/^.*\///' -e 's/"$//' <<< $(echo "$CLUSTER_INSTANCES" | jq '.['"$CLUSTER_INSTANCE_INDEX"']'))
+      CLUSTER_EC2_INSTANCE_ID=$(sed -e 's/^"//' -e 's/"$//' <<< $(aws ecs describe-container-instances --cluster sample --container-instances "$CLUSTER_INSTANCE_ID" | jq '.containerInstances[0].ec2InstanceId'))
+      if [ "$CLUSTER_EC2_INSTANCE_ID" == "$NEW_INSTANCE_ID" ]; then
+        break 2
+      fi
+    done
+    sleep 2
+  done
 }
 
 function findNewInstanceInformation() {
@@ -119,7 +142,7 @@ function findNewInstanceInformation() {
     exit 2
   else
     NEW_INSTANCE_PUBLIC_IP=$THIS_INSTANCE_IP
-    NEW_INSTANCE_PUBLIC_ID=$THIS_INSTANCE_ID
+    NEW_INSTANCE_ID=$THIS_INSTANCE_ID
   fi
 }
 
@@ -127,7 +150,6 @@ function declareConstants() {
   CPU_COEF=1024
   MEMORY_COEF=926
   AWS_EC2_AMI="ami-40142d25"
-  #AWS_EC2_AMI="ami-09a64272e7fe706b6"
 }
 
 function calculateSumResourceRequirementsForTask() {
@@ -186,20 +208,48 @@ function getMinimumSuitableInstanceType() {
   fi
 }
 
-function registerEcsTaskDefinition() {
-  ./registerEcsTaskDefinition.sh "$TASK_NAME" "${CONTAINERS[*]}" "$AWS_REGION"
-  exitIfScriptFailed
+function registerEcsTaskDefinitionIfNeeded() {
+  if [ "$REGISTERING_NEW_TASK_DEFINITION" == true ]; then
+    ./registerEcsTaskDefinition.sh "$TASK_NAME" "${CONTAINERS[*]}" "$OVERWRITE_ECR" "$AWS_REGION"
+    exitIfScriptFailed
+  fi
 }
 
 function launchTask() {
-  sleep 10
-  aws ecs run-task --cluster "$CLUSTER_NAME" --task-definition "$TASK_NAME" --region "$AWS_REGION"
+  if [ "$REVISION" == "hasnotbeenset" ] || [ "$REVISION" == "latest" ] ; then
+    ECS_LAUNCH_STATUS=$(aws ecs run-task --cluster "$CLUSTER_NAME" --task-definition "$TASK_NAME" --region "$AWS_REGION")
+  else
+    ECS_LAUNCH_STATUS=$(aws ecs run-task --cluster "$CLUSTER_NAME" --task-definition "$TASK_NAME":"$REVISION" --region "$AWS_REGION")
+  fi
 }
 
 function exitIfScriptFailed() {
   if [ $? -eq 2 ]; then
     exit 2
   fi
+}
+
+function gatherTaskDefinitionResourcesRequired() {
+  NUMBER_REGEX='^[0-9]+$'
+  if [ ! "$REVISION" == "latest" ] && [[ $REVISION =~ $NUMBER_REGEX ]]; then
+    TASK_NAME_WITH_REVISION="$TASK_NAME"":""$REVISION"
+  else
+    TASK_NAME_WITH_REVISION="$TASK_NAME"
+  fi
+  TASK_DEFINITION_INFO=$(aws ecs describe-task-definition --task-definition "$TASK_NAME_WITH_REVISION" --region "$AWS_REGION" 2>/dev/null)
+  if [ $? -eq 0 ]; then
+    TASK_DEFINITION_INFO=$(echo $TASK_DEFINITION_INFO | jq '.taskDefinition.containerDefinitions')
+  else
+    echo "ERROR! The revision number specifed does not exist"
+    exit 2
+  fi
+  CONTAINER_DEFINITION_COUNT=$(echo "$TASK_DEFINITION_INFO" | jq '. | length')
+  for (( CONTAINER_DEFINITION_INDEX=0; CONTAINER_DEFINITION_INDEX<CONTAINER_DEFINITION_COUNT; CONTAINER_DEFINITION_INDEX++ )); do
+    THIS_CONTAINER_CPU_REQUIREMENT=$(echo "$TASK_DEFINITION_INFO" | jq '.['"$CONTAINIER_DEFINITION_INDEX"'].cpu')
+    THIS_CONTAINER_MEMORY_REQUIREMENT=$(echo "$TASK_DEFINITION_INFO" | jq '.['"$CONTAINIER_DEFINITION_INDEX"'].memory')
+    CPU+=($THIS_CONTAINER_CPU_REQUIREMENT)
+    MEMORY+=($THIS_CONTAINER_MEMORY_REQUIREMENT)
+  done
 }
 
 declareConstants
@@ -210,5 +260,5 @@ calculateSumResourceRequirementsForTask
 findExistingSuitableInstanceInCluster
 getMinimumSuitableInstanceType
 createAndRegisterNewInstanceIfNeeded
-registerEcsTaskDefinition
+registerEcsTaskDefinitionIfNeeded
 launchTask
