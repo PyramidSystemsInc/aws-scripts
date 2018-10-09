@@ -1,9 +1,7 @@
 
-1. Ensure names are unique when creating a key pair / EC2 instance
+1. Get port flags working in Docker's native language in the `--container` flag of `launchEcsTask.sh`
 
-2. Get port flags working in Docker's native language in the `--container` flag of `launchEcsTask.sh`
+2. Validate Docker Hub images exist using `docker search`
 
-3. Validate Docker Hub images exist using `docker search`
-
-4. Create scripts to destroy resources
+3. Create scripts to destroy resources
 

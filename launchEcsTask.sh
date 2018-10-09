@@ -1,4 +1,4 @@
-#! /bin/bash
+# /bin/bash
 
 # Query to see if the ECS cluster exists. If it does not, create the ECS cluster
 function createClusterIfItDoesNotExist() {
@@ -79,7 +79,11 @@ function parseDockerRunCommand() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --name) NAME+=("$2"); shift 2;;
+      -p) PORT_MAPPINGS+=("$2"); shift 2;;
+      --publish) PORT_MAPPINGS+=("$2"); shift 2;;
+      -c) CPU+=($(($2 * $CPU_COEF))); shift 2;;
       --cpu) CPU+=($(($2 * $CPU_COEF))); shift 2;;
+      -m) MEM=$(echo "scale=0; (($2 * $MEMORY_COEF) / 1)" | bc); MEMORY+=("$MEM"); shift 2;;
       --memory) MEM=$(echo "scale=0; (($2 * $MEMORY_COEF) / 1)" | bc); MEMORY+=("$MEM"); shift 2;;
       docker) shift 1;;
       run) shift 1;;
@@ -96,21 +100,52 @@ function parseDockerRunCommand() {
 
 function createAndRegisterNewInstanceIfNeeded() {
   if [ "$INSTANCE_SUITS_TASK" == false ]; then
-    CLUSTER_STATUS=$(aws ecs describe-clusters --clusters "$CLUSTER_NAME" | jq '.clusters[0]')
-    CLUSTER_INSTANCE_COUNT=$(echo "$CLUSTER_STATUS" | jq '.registeredContainerInstancesCount')
-    NEXT_CLUSTER_INDEX=$(($CLUSTER_INSTANCE_COUNT + 1))
-    # TODO: Ensure name is unique
-    NEW_INSTANCE_NAME=ecs-"$CLUSTER_NAME"-"$NEXT_CLUSTER_INDEX"
-    ./createEc2Instance.sh --name "$NEW_INSTANCE_NAME" --image "$AWS_EC2_AMI" --type "$MINIMUM_SUITABLE_INSTANCE_TYPE" --iam-role jenkins_instance --port 22 --startup-script installEcsAgentOnEc2Instance.sh
+    getNewUniqueInstanceName
+    createNewInstanceOpenPortSpec
+    COMMAND="./createEc2Instance.sh --name "$NEW_INSTANCE_NAME" --image "$AWS_EC2_AMI" --type "$MINIMUM_SUITABLE_INSTANCE_TYPE" --iam-role jenkins_instance --port 22 "$NEW_INSTANCE_OPEN_PORTS_SPEC" --startup-script installEcsAgentOnEc2Instance.sh"
+    $($COMMAND >> /dev/null)
     exitIfScriptFailed
     findNewInstanceInformation
     waitUntilInstanceRegisteredInCluster
   fi
 }
 
+# Get a unique name in the form of `ecs-<CLUSTER_NAME>-<UNIQUE_NUMBER>` which
+# does not conflict with any existing EC2 key pair or EC2 security group names
+function getNewUniqueInstanceName() {
+  CLUSTER_STATUS=$(aws ecs describe-clusters --clusters "$CLUSTER_NAME" | jq '.clusters[0]')
+  CLUSTER_INSTANCE_COUNT=$(echo "$CLUSTER_STATUS" | jq '.registeredContainerInstancesCount')
+  CANDIDATE_INDEX=$(($CLUSTER_INSTANCE_COUNT + 1))
+  KEY_PAIRS=$(aws ec2 describe-key-pairs --region "$AWS_REGION" | jq '.KeyPairs')
+  KEY_PAIR_COUNT=$(echo "$KEY_PAIRS" | jq '. | length')
+  SECURITY_GROUPS=$(aws ec2 describe-security-groups --region "$AWS_REGION" | jq '.SecurityGroups')
+  SECURITY_GROUP_COUNT=$(echo "$SECURITY_GROUPS" | jq '. | length')
+  UNIQUE_NAME_FOUND=false
+  while [ "$UNIQUE_NAME_FOUND" == "false" ] ; do
+    UNIQUE_NAME_FOUND=true
+    INSTANCE_NAME_CANDIDATE=ecs-"$CLUSTER_NAME"-"$CANDIDATE_INDEX"
+    for (( KEY_PAIR_INDEX=0; KEY_PAIR_INDEX<KEY_PAIR_COUNT; KEY_PAIR_INDEX++ )); do
+      THIS_KEY_PAIR=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo "$KEY_PAIRS" | jq '.['"$KEY_PAIR_INDEX"'].KeyName'))
+      if [ "$INSTANCE_NAME_CANDIDATE" == "$THIS_KEY_PAIR" ]; then
+        UNIQUE_NAME_FOUND=false
+        break
+      fi
+    done
+    for (( SECURITY_GROUP_INDEX=0; SECURITY_GROUP_INDEX<SECURITY_GROUP_COUNT; SECURITY_GROUP_INDEX++ )); do
+      THIS_SECURITY_GROUP=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo "$SECURITY_GROUPS" | jq '.['"$SECURITY_GROUP_INDEX"'].GroupName'))
+      if [ "$INSTANCE_NAME_CANDIDATE" == "$THIS_SECURITY_GROUP" ]; then
+        UNIQUE_NAME_FOUND=false
+        break
+      fi
+    done
+    CANDIDATE_INDEX=$(($CANDIDATE_INDEX + 1))
+  done
+  NEW_INSTANCE_NAME="$INSTANCE_NAME_CANDIDATE"
+}
+
 function waitUntilInstanceRegisteredInCluster() {
   while : ; do
-    CLUSTER_INSTANCES=$(aws ecs list-container-instances --cluster sample --region us-east-2 | jq '.containerInstanceArns')
+    CLUSTER_INSTANCES=$(aws ecs list-container-instances --cluster sample --region "$AWS_REGION" | jq '.containerInstanceArns')
     CLUSTER_INSTANCE_COUNT=$(echo $CLUSTER_INSTANCES | jq '. | length')
     for (( CLUSTER_INSTANCE_INDEX=0; CLUSTER_INSTANCE_INDEX<CLUSTER_INSTANCE_COUNT; CLUSTER_INSTANCE_INDEX++ )); do
       CLUSTER_INSTANCE_ID=$(sed -e 's/^.*\///' -e 's/"$//' <<< $(echo "$CLUSTER_INSTANCES" | jq '.['"$CLUSTER_INSTANCE_INDEX"']'))
@@ -237,6 +272,7 @@ function gatherTaskDefinitionResourcesRequired() {
     TASK_NAME_WITH_REVISION="$TASK_NAME"
   fi
   TASK_DEFINITION_INFO=$(aws ecs describe-task-definition --task-definition "$TASK_NAME_WITH_REVISION" --region "$AWS_REGION" 2>/dev/null)
+  # TODO: This is where port mappings should be retrieved from when using existing task definitions
   if [ $? -eq 0 ]; then
     TASK_DEFINITION_INFO=$(echo $TASK_DEFINITION_INFO | jq '.taskDefinition.containerDefinitions')
   else
@@ -252,6 +288,13 @@ function gatherTaskDefinitionResourcesRequired() {
   done
 }
 
+function createNewInstanceOpenPortSpec() {
+  NEW_INSTANCE_OPEN_PORTS_SPEC=""
+  for PORT_MAPPING in "${PORT_MAPPINGS[@]}"; do
+    NEW_INSTANCE_OPEN_PORTS_SPEC+="--port $(sed -e 's/:.*$//' <<< $PORT_MAPPING) "
+  done
+}
+
 declareConstants
 handleInput "$@"
 defineColorPalette
@@ -262,3 +305,21 @@ getMinimumSuitableInstanceType
 createAndRegisterNewInstanceIfNeeded
 registerEcsTaskDefinitionIfNeeded
 launchTask
+
+# 104 and 246 are where ports need to be set up (in this script)
+
+# host:container
+# host is for Ec2 Instance
+# both are for the task definition
+
+# PUT ONE WAY
+# If creating a new instance and creating a new task definition,... expose all the correct ports from the port mappings provided
+# If creating a new instance and using an existing task definition,... lookup the host ports required and expose all that is needed
+# If using an existing instance and creating a new task definition,... redo all the ports to fit the current task from port mappings
+# If using an existing instance and using an existing task definition,... lookup the host ports required and redo all the ports
+
+# PUT ANOTHER WAY
+# If creating a new instance and creating a new task definition,... createNewInstanceOpenPortSpec()
+# If creating a new instance and using an existing task definition,... getOpenPortsRequiredForTaskDefinitions() & createNewInstanceOpenPortSpec()
+# If using an existing instance and creating a new task definition,... editInstanceOpenPorts()
+# If using an existing instance and using an existing task definition,... getOpenPortsRequiredForTaskDefinitions() & editInstanceOpenPorts()

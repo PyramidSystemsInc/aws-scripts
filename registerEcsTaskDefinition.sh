@@ -38,7 +38,11 @@ function parseDockerRunCommand() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --name) NAME+=("$2"); shift 2;;
+      -p) PORT_MAPPINGS+=("$2"); shift 2;;
+      --publish) PORT_MAPPINGS+=("$2"); shift 2;;
+      -c) CPU+=($(($2 * $CPU_COEF))); shift 2;;
       --cpu) CPU+=($(($2 * $CPU_COEF))); shift 2;;
+      -m) MEM=$(echo "scale=0; (($2 * $MEMORY_COEF) / 1)" | bc); MEMORY+=("$MEM"); shift 2;;
       --memory) MEM=$(echo "scale=0; (($2 * $MEMORY_COEF) / 1)" | bc); MEMORY+=("$MEM"); shift 2;;
       docker) shift 1;;
       run) shift 1;;
@@ -70,11 +74,6 @@ function createTaskDefinitionJson() {
 			TASK_DEFINITION="$TASK_DEFINITION"$(cat <<-EOF
 
 				    {
-				      "name": "$THIS_NAME",
-				      "image": "$THIS_IMAGE",
-				      "cpu": $THIS_CPU,
-				      "memory": $THIS_MEMORY,
-				      "essential": true
 
 			EOF
 			)
@@ -83,15 +82,20 @@ function createTaskDefinitionJson() {
 
 				    },
 				    {
-				      "name": "$THIS_NAME",
-				      "image": "$THIS_IMAGE",
-				      "cpu": $THIS_CPU,
-				      "memory": $THIS_MEMORY,
-				      "essential": true
 
 			EOF
 			)
     fi
+		TASK_DEFINITION="$TASK_DEFINITION"$(cat <<-EOF
+
+			      "name": "$THIS_NAME",
+			      "image": "$THIS_IMAGE",
+			      "cpu": $THIS_CPU,
+			      "memory": $THIS_MEMORY,
+			      "essential": true
+
+		EOF
+		)
   done
 	TASK_DEFINITION="$TASK_DEFINITION"$(cat <<-EOF
 
@@ -100,6 +104,8 @@ function createTaskDefinitionJson() {
 		}
 	EOF
   )
+  echo "$TASK_DEFINITION"
+  exit 2
 }
 
 function registerTaskDefinition() {
