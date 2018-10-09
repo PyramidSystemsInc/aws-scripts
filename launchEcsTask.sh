@@ -69,22 +69,29 @@ function handleInput() {
 
 # Break Docker run statement into individual variables
 function parseAllDockerRunCommands() {
+  declare -g -A CONTAINER_DEFINITIONS
+  CONTAINER_DEFINITION_MAX_INDEX=0
   for CONTAINER in "${CONTAINERS[@]}"; do
     parseDockerRunCommand $CONTAINER
+    CONTAINER_DEFINITION_MAX_INDEX=$(($CONTAINER_DEFINITION_MAX_INDEX + 1))
   done
 }
 
 function parseDockerRunCommand() {
   ARGS=()
+  THIS_NAME=""
+  THIS_PORT_MAPPINGS=()
+  THIS_CPU=""
+  THIS_MEMORY=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      --name) NAME+=("$2"); shift 2;;
-      -p) PORT_MAPPINGS+=("$2"); shift 2;;
-      --publish) PORT_MAPPINGS+=("$2"); shift 2;;
-      -c) CPU+=($(($2 * $CPU_COEF))); shift 2;;
-      --cpu) CPU+=($(($2 * $CPU_COEF))); shift 2;;
-      -m) MEM=$(echo "scale=0; (($2 * $MEMORY_COEF) / 1)" | bc); MEMORY+=("$MEM"); shift 2;;
-      --memory) MEM=$(echo "scale=0; (($2 * $MEMORY_COEF) / 1)" | bc); MEMORY+=("$MEM"); shift 2;;
+      --name) THIS_NAME=("$2"); shift 2;;
+      -p) THIS_PORT_MAPPINGS+=("$2"); shift 2;;
+      --publish) THIS_PORT_MAPPINGS+=("$2"); shift 2;;
+      -c) THIS_CPU=($(($2 * $CPU_COEF))); shift 2;;
+      --cpu) THIS_CPU=($(($2 * $CPU_COEF))); shift 2;;
+      -m) THIS_MEMORY=$(echo "scale=0; (($2 * $MEMORY_COEF) / 1)" | bc); shift 2;;
+      --memory) THIS_MEMORY=$(echo "scale=0; (($2 * $MEMORY_COEF) / 1)" | bc); shift 2;;
       docker) shift 1;;
       run) shift 1;;
       -*) echo "unknown option: $1" >&2; exit 1;;
@@ -93,9 +100,14 @@ function parseDockerRunCommand() {
   done
   for ARG in "${ARGS[@]}"; do
     if [ -n "$ARG" ]; then
-      IMAGE+=("$ARG")
+      THIS_IMAGE=("$ARG")
     fi
   done
+  CONTAINER_DEFINITIONS[$CONTAINER_DEFINITION_MAX_INDEX,name]="$THIS_NAME"
+  CONTAINER_DEFINITIONS[$CONTAINER_DEFINITION_MAX_INDEX,image]="${THIS_IMAGE}"
+  CONTAINER_DEFINITIONS[$CONTAINER_DEFINITION_MAX_INDEX,cpu]="$THIS_CPU"
+  CONTAINER_DEFINITIONS[$CONTAINER_DEFINITION_MAX_INDEX,memory]="$THIS_MEMORY"
+  CONTAINER_DEFINITIONS[$CONTAINER_DEFINITION_MAX_INDEX,port-mappings]="${THIS_PORT_MAPPINGS[@]}"
 }
 
 function createAndRegisterNewInstanceIfNeeded() {
@@ -245,8 +257,9 @@ function getMinimumSuitableInstanceType() {
 
 function registerEcsTaskDefinitionIfNeeded() {
   if [ "$REGISTERING_NEW_TASK_DEFINITION" == true ]; then
-    ./registerEcsTaskDefinition.sh "$TASK_NAME" "${CONTAINERS[*]}" "$OVERWRITE_ECR" "$AWS_REGION"
-    exitIfScriptFailed
+    validateDockerImages
+    createTaskDefinitionJson
+    registerTaskDefinition
   fi
 }
 
@@ -295,18 +308,229 @@ function createNewInstanceOpenPortSpec() {
   done
 }
 
+function createTaskDefinitionJson() {
+	TASK_DEFINITION=$(cat <<-EOF
+		{
+		  "family": "$TASK_NAME",
+		  "containerDefinitions": [
+	EOF
+  )
+  CONTAINER_INDEX=0
+  for CONTAINER_DEFINITIONS in ${!CONTAINER_DEFINITIONS@}; do
+    if [ $CONTAINER_INDEX -eq 0 ]; then
+			TASK_DEFINITION="$TASK_DEFINITION"$(cat <<-EOF
+
+				    {
+
+			EOF
+			)
+    else
+			TASK_DEFINITION="$TASK_DEFINITION"$(cat <<-EOF
+
+				    },
+				    {
+
+			EOF
+			)
+    fi
+		TASK_DEFINITION="$TASK_DEFINITION"$(cat <<-EOF
+
+			      "name": "${CONTAINER_DEFINITIONS[0,name]}",
+			      "image": "${CONTAINER_DEFINITIONS[0,image]}",
+			      "cpu": ${CONTAINER_DEFINITIONS[0,cpu]},
+			      "memory": ${CONTAINER_DEFINITIONS[0,memory]},
+			      "essential": true,
+			      "portMappings": [
+
+		EOF
+		)
+    PORT_MAPPINGS=(${CONTAINER_DEFINITIONS[0,port-mappings]})
+    PORT_MAPPINGS_INDEX=0
+    for PORT_MAPPING in "${PORT_MAPPINGS[@]}"; do
+      if [ $PORT_MAPPINGS_INDEX -eq 0 ]; then
+				TASK_DEFINITION="$TASK_DEFINITION"$(cat <<-EOF
+
+					        {
+
+				EOF
+				)
+      else
+				TASK_DEFINITION="$TASK_DEFINITION"$(cat <<-EOF
+
+					        },
+					        {
+
+				EOF
+				)
+      fi
+      HOST_PORT=$(sed -e 's/:.*$//g' <<< $PORT_MAPPING)
+      CONTAINER_PORT=$(sed -e 's/^.*://g' <<< $PORT_MAPPING)
+			TASK_DEFINITION="$TASK_DEFINITION"$(cat <<-EOF
+
+				          "hostPort": $HOST_PORT,
+				          "containerPort": $CONTAINER_PORT,
+				          "protocol": "tcp"
+
+			EOF
+			)
+      PORT_MAPPINGS_INDEX=$(($PORT_MAPPINGS_INDEX + 1))
+    done
+    if [ $PORT_MAPPINGS_INDEX -ge 1 ]; then
+			TASK_DEFINITION="$TASK_DEFINITION"$(cat <<-EOF
+
+					        }
+
+			EOF
+			)
+    fi
+		TASK_DEFINITION="$TASK_DEFINITION"$(cat <<-EOF
+
+			      ]
+
+		EOF
+		)
+    CONTAINER_INDEX=$(($CONTAINER_INDEX + 1))
+  done
+	TASK_DEFINITION="$TASK_DEFINITION"$(cat <<-EOF
+
+		    }
+		  ]
+		}
+	EOF
+  )
+}
+
+function registerTaskDefinition() {
+  aws ecs register-task-definition --cli-input-json "$TASK_DEFINITION" --region "$AWS_REGION" >> /dev/null
+}
+
+function validateDockerImages() {
+  $(aws ecr get-login --no-include-email --region us-east-2) >/dev/null 2>/dev/null
+  IMAGE_INDEX=0
+  for CONTAINER_DEFINITIONS in ${!CONTAINER_DEFINITIONS@}; do
+    validateDockerImage
+    IMAGE_INDEX=$((IMAGE_INDEX + 1))
+  done
+}
+
+function validateDockerImage() {
+  THIS_IMAGE="${CONTAINER_DEFINITIONS[$IMAGE_INDEX,image]}"
+  splitImageIntoParts
+  if [ "$USER_SPECIFIED_ECR" == true ]; then
+    validateEcrDockerImage
+  else
+    validateLocalDockerOrDockerHubImage
+  fi
+}
+
+function validateLocalDockerOrDockerHubImage() {
+  DOCKER_IMAGES_EMPTY_OUTPUT_SIZE=84
+  IMAGE_EXISTS_LOCALLY=false
+  IMAGE_EXISTS_ON_DOCKER_HUB=false
+  LOCAL_DOCKER_IMAGES=$(docker images "$THIS_IMAGE")
+  if [ ! "${#LOCAL_DOCKER_IMAGES}" -eq $DOCKER_IMAGES_EMPTY_OUTPUT_SIZE ]; then
+    IMAGE_EXISTS_LOCALLY=true
+  fi
+  if [ "$IMAGE_EXISTS_LOCALLY" == true ]; then
+    if [ "$OVERWRITE_ECR" == false ]; then
+      exitIfEcrImageTagComboAlreadyExists
+    fi
+    if [ "$REPO_EXISTS_IN_ECR" == false ]; then
+      ECR_REPOSITORY_URI=$(sed -e 's/^"//' -e 's/"$//' <<< $(aws ecr create-repository --repository-name "$THIS_IMAGE_NAME" --region "$AWS_REGION" | jq '.repository.repositoryUri'))
+    else
+      ECR_REPOSITORY_URI=$(sed -e 's/^"//' -e 's/"$//' <<< $(aws ecr describe-repositories --repository "$THIS_IMAGE_NAME" --region "$AWS_REGION" | jq '.repositories[0].repositoryUri'))
+    fi
+    THIS_IMAGE_ECR="$ECR_REPOSITORY_URI":"$THIS_IMAGE_TAG"
+    docker tag "$THIS_IMAGE" "$THIS_IMAGE_ECR"
+    docker push "$THIS_IMAGE_ECR" >> /dev/null
+    CONTAINER_DEFINITIONS[$IMAGE_INDEX,image]="$THIS_IMAGE_ECR"
+  else
+    # TODO: Check if image exists on Docker Hub
+    echo Image does not exist locally
+  fi
+}
+
+function splitImageIntoParts() {
+  if [[ "$THIS_IMAGE" =~ ^.*:.*$ ]]; then
+    THIS_IMAGE_NAME="${THIS_IMAGE%:*}"
+    THIS_IMAGE_TAG="${THIS_IMAGE#*:}"
+  else
+    THIS_IMAGE_NAME="$THIS_IMAGE"
+    THIS_IMAGE_TAG="latest"
+    THIS_IMAGE="$THIS_IMAGE_NAME"":""$THIS_IMAGE_TAG"
+  fi
+  USER_SPECIFIED_ECR=false
+  if [[ "$THIS_IMAGE" =~ ^ecr/.* ]]; then
+    USER_SPECIFIED_ECR=true
+  fi
+}
+
+function exitIfEcrImageTagComboAlreadyExists() {
+  REPO_EXISTS_IN_ECR=false
+  ECR_REPOS=$(aws ecr describe-repositories --region "$AWS_REGION" | jq '.repositories')
+  ECR_REPO_COUNT=$(echo "$ECR_REPOS" | jq '. | length')
+  for (( ECR_REPO_INDEX=0; ECR_REPO_INDEX<ECR_REPO_COUNT; ECR_REPO_INDEX++ )); do
+    THIS_ECR_REPO=$(echo "$ECR_REPOS" | jq '.['"$ECR_REPO_INDEX"']')
+    THIS_ECR_REPO_NAME=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo "$THIS_ECR_REPO" | jq '.repositoryName'))
+    if [ "$THIS_ECR_REPO_NAME" == "$THIS_IMAGE_NAME" ]; then
+      REPO_EXISTS_IN_ECR=true
+      ECR_IMAGES=$(aws ecr list-images --repository-name "$THIS_ECR_REPO_NAME" --region "$AWS_REGION" | jq '.imageIds')
+      ECR_IMAGE_COUNT=$(echo "$ECR_IMAGES" | jq '. | length')
+      for (( ECR_IMAGE_INDEX=0; ECR_IMAGE_INDEX<ECR_IMAGE_COUNT; ECR_IMAGE_INDEX++ )); do
+        ECR_IMAGE_TAG=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo "$ECR_IMAGES" | jq '.['"$ECR_IMAGE_INDEX"'].imageTag'))
+        if [ ! $ECR_IMAGE_TAG == null ]; then
+          if [ "$ECR_IMAGE_TAG" == "$THIS_IMAGE_TAG" ]; then
+            echo "ERROR: The image ""$THIS_IMAGE"" already exists in ECR. The task creation was abandoned because creating it would require overwriting the image in ECR. If you wish to use the image in ECR, run the image ecr/""$THIS_IMAGE"". If you want to use your local image, either retag it using 'docker tag ""$THIS_IMAGE"" ""$THIS_IMAGE_NAME"":<new-tag-here>' or re-run your command with the '--overwrite-ecr' flag"
+            exit 2
+          fi
+        fi
+      done
+    fi
+  done
+}
+
+function validateEcrDockerImage() {
+  IMAGE_EXISTS_IN_ECR=false
+  ECR_REPOS=$(aws ecr describe-repositories --region "$AWS_REGION" | jq '.repositories')
+  ECR_REPO_COUNT=$(echo "$ECR_REPOS" | jq '. | length')
+  THIS_IMAGE_NAME=$(echo -n "$THIS_IMAGE_NAME" | tail -c +5)
+  for (( ECR_REPO_INDEX=0; ECR_REPO_INDEX<ECR_REPO_COUNT; ECR_REPO_INDEX++ )); do
+    THIS_ECR_REPO=$(echo "$ECR_REPOS" | jq '.['"$ECR_REPO_INDEX"']')
+    THIS_ECR_REPO_NAME=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo "$THIS_ECR_REPO" | jq '.repositoryName'))
+    if [ "$THIS_ECR_REPO_NAME" == "$THIS_IMAGE_NAME" ]; then
+      REPO_EXISTS_IN_ECR=true
+      ECR_IMAGES=$(aws ecr list-images --repository-name "$THIS_ECR_REPO_NAME" --region "$AWS_REGION" | jq '.imageIds')
+      ECR_IMAGE_COUNT=$(echo "$ECR_IMAGES" | jq '. | length')
+      for (( ECR_IMAGE_INDEX=0; ECR_IMAGE_INDEX<ECR_IMAGE_COUNT; ECR_IMAGE_INDEX++ )); do
+        ECR_IMAGE_TAG=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo "$ECR_IMAGES" | jq '.['"$ECR_IMAGE_INDEX"'].imageTag'))
+        if [ ! $ECR_IMAGE_TAG == null ]; then
+          if [ "$ECR_IMAGE_TAG" == "$THIS_IMAGE_TAG" ]; then
+            IMAGE_EXISTS_IN_ECR=true
+            THIS_ECR_REPO_URI=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo "$THIS_ECR_REPO" | jq '.repositoryUri'))
+            CONTAINER_DEFINITIONS[$IMAGE_INDEX,image]="$THIS_ECR_REPO_URI":"$THIS_IMAGE_TAG"
+            break
+          fi
+        fi
+      done
+    fi
+  done
+  if [ "$IMAGE_EXISTS_IN_ECR" == false ]; then
+    echo "ERROR: The image ""$THIS_IMAGE"" could not be found in ECR. Are you using the correct AWS account and region? Are you using the correct tag?"
+    exit 2
+  fi
+}
+
 declareConstants
 handleInput "$@"
 defineColorPalette
 createClusterIfItDoesNotExist
 calculateSumResourceRequirementsForTask
 findExistingSuitableInstanceInCluster
+#editSuitableInstanceOpenPorts
 getMinimumSuitableInstanceType
 createAndRegisterNewInstanceIfNeeded
 registerEcsTaskDefinitionIfNeeded
 launchTask
-
-# 104 and 246 are where ports need to be set up (in this script)
 
 # host:container
 # host is for Ec2 Instance
@@ -319,7 +543,7 @@ launchTask
 # If using an existing instance and using an existing task definition,... lookup the host ports required and redo all the ports
 
 # PUT ANOTHER WAY
-# If creating a new instance and creating a new task definition,... createNewInstanceOpenPortSpec()
-# If creating a new instance and using an existing task definition,... getOpenPortsRequiredForTaskDefinitions() & createNewInstanceOpenPortSpec()
+# DONE - If creating a new instance and creating a new task definition,... createNewInstanceOpenPortSpec()
+# If creating a new instance and using an existing task definition,... getOpenPortsRequiredForTaskDefinitions() & createNewInstanceOpenPortSpec() - 288
 # If using an existing instance and creating a new task definition,... editInstanceOpenPorts()
 # If using an existing instance and using an existing task definition,... getOpenPortsRequiredForTaskDefinitions() & editInstanceOpenPorts()
