@@ -200,14 +200,20 @@ function declareConstants() {
 }
 
 function calculateSumResourceRequirementsForTask() {
-  CPU_REQUIREMENT=0
-  for CPU_VALUE in "${CPU[@]}"; do
-    CPU_REQUIREMENT=$(($CPU_REQUIREMENT + $CPU_VALUE))
+  CPU_REQUIREMENT=$EXISTING_TASK_CPU_REQUIREMENT
+  MEMORY_REQUIREMENT=$EXISTING_TASK_MEMORY_REQUIREMENT
+  for (( CONTAINER_DEFINITIONS_INDEX=0; CONTAINER_DEFINITIONS_INDEX<CONTAINER_DEFINITION_MAX_INDEX; CONTAINER_DEFINITIONS_INDEX++ )); do
+    echo ${CONTAINER_DEFINITIONS[$CONTAINER_DEFINITIONS_INDEX,cpu]}
+    echo ${CONTAINER_DEFINITIONS[$CONTAINER_DEFINITIONS_INDEX,memory]}
+    CPU_REQUIREMENT=$(($CPU_REQUIREMENT + ${CONTAINER_DEFINITIONS[$CONTAINER_DEFINITIONS_INDEX,cpu]}))
+    MEMORY_REQUIREMENT=$(($CPU_REQUIREMENT + ${CONTAINER_DEFINITIONS[$CONTAINER_DEFINITIONS_INDEX,memory]}))
   done
-  MEMORY_REQUIREMENT=0
-  for MEMORY_VALUE in "${MEMORY[@]}"; do
-    MEMORY_REQUIREMENT=$(($MEMORY_REQUIREMENT + $MEMORY_VALUE))
-  done
+#  for CPU_VALUE in "${CPU[@]}"; do
+#    CPU_REQUIREMENT=$(($CPU_REQUIREMENT + $CPU_VALUE))
+#  done
+#  for MEMORY_VALUE in "${MEMORY[@]}"; do
+#    MEMORY_REQUIREMENT=$(($MEMORY_REQUIREMENT + $MEMORY_VALUE))
+#  done
 }
 
 function findExistingSuitableInstanceInCluster() {
@@ -296,8 +302,8 @@ function gatherTaskDefinitionResourcesRequired() {
   for (( CONTAINER_DEFINITION_INDEX=0; CONTAINER_DEFINITION_INDEX<CONTAINER_DEFINITION_COUNT; CONTAINER_DEFINITION_INDEX++ )); do
     THIS_CONTAINER_CPU_REQUIREMENT=$(echo "$TASK_DEFINITION_INFO" | jq '.['"$CONTAINIER_DEFINITION_INDEX"'].cpu')
     THIS_CONTAINER_MEMORY_REQUIREMENT=$(echo "$TASK_DEFINITION_INFO" | jq '.['"$CONTAINIER_DEFINITION_INDEX"'].memory')
-    CPU+=($THIS_CONTAINER_CPU_REQUIREMENT)
-    MEMORY+=($THIS_CONTAINER_MEMORY_REQUIREMENT)
+    EXISTING_TASK_CPU_REQUIREMENT+=($THIS_CONTAINER_CPU_REQUIREMENT)
+    EXISTING_TASK_MEMORY_REQUIREMENT+=($THIS_CONTAINER_MEMORY_REQUIREMENT)
   done
 }
 
@@ -398,6 +404,8 @@ function createTaskDefinitionJson() {
 		}
 	EOF
   )
+  echo "$TASK_DEFINITION"
+  exit 2
 }
 
 function registerTaskDefinition() {
@@ -531,19 +539,3 @@ getMinimumSuitableInstanceType
 createAndRegisterNewInstanceIfNeeded
 registerEcsTaskDefinitionIfNeeded
 launchTask
-
-# host:container
-# host is for Ec2 Instance
-# both are for the task definition
-
-# PUT ONE WAY
-# If creating a new instance and creating a new task definition,... expose all the correct ports from the port mappings provided
-# If creating a new instance and using an existing task definition,... lookup the host ports required and expose all that is needed
-# If using an existing instance and creating a new task definition,... redo all the ports to fit the current task from port mappings
-# If using an existing instance and using an existing task definition,... lookup the host ports required and redo all the ports
-
-# PUT ANOTHER WAY
-# DONE - If creating a new instance and creating a new task definition,... createNewInstanceOpenPortSpec()
-# If creating a new instance and using an existing task definition,... getOpenPortsRequiredForTaskDefinitions() & createNewInstanceOpenPortSpec() - 288
-# If using an existing instance and creating a new task definition,... editInstanceOpenPorts()
-# If using an existing instance and using an existing task definition,... getOpenPortsRequiredForTaskDefinitions() & editInstanceOpenPorts()
