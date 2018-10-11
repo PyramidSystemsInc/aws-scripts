@@ -1,117 +1,67 @@
-# /bin/bash
+#! /bin/bash
 
-# Query to see if the ECS cluster exists. If it does not, create the ECS cluster
-function createClusterIfItDoesNotExist() {
-  CLUSTER_EXISTS=false
-  CLUSTER_ARNS=$(aws ecs list-clusters | jq '.clusterArns')
-  CLUSTER_COUNT=$(echo "$CLUSTER_ARNS" | jq '. | length')
-  for (( CLUSTER_INDEX=0; CLUSTER_INDEX<CLUSTER_COUNT; CLUSTER_INDEX++ )); do
-    THIS_CLUSTER_NAME=$(sed -e 's|.*/||' -e 's/"$//' <<< $(echo "$CLUSTER_ARNS" | jq '.['"$CLUSTER_INDEX"']'))
-    if [ "$THIS_CLUSTER_NAME" == "$CLUSTER_NAME" ]; then
-      CLUSTER_EXISTS=true
-    fi
-  done
-  if [ "$CLUSTER_EXISTS" == "false" ]; then
-    ./createEcsCluster.sh --name "$CLUSTER_NAME" --region "$AWS_REGION"
-    exitIfScriptFailed
-  fi
-}
-
-# Define all colors used for output
-function defineColorPalette() {
-  COLOR_RED='\033[0;91m'
-  COLOR_WHITE_BOLD='\033[1;97m'
-  COLOR_NONE='\033[0m'
-}
-
-# Handle user input
-function handleInput() {
-  AWS_REGION="us-east-2"
-  OVERWRITE_ECR=false
-  REVISION="hasnotbeenset"
-  CONTAINERS=()
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      # Required inputs
-      --cluster) CLUSTER_NAME=$2; shift 2;;
-      --task) TASK_NAME="$2"; shift 2;;
-      # One, and only one, of the following inputs is required
-      --container) CONTAINERS+=("$2"); shift 2;;
-      --revision) REVISION=("$2"); shift 2;;
-      # Optional inputs
-      --overwrite-ecr) OVERWRITE_ECR=true; shift 1;;
-      --region) AWS_REGION="$2"; shift 2;;
-      # Optional inputs yet to be implemented
-      --skip-output) NO_OUTPUT=true; shift 1;;
-      -h) HELP_WANTED=true; shift 1;;
-      --help) HELP_WANTED=true; shift 1;;
-      -*) echo "unknown option: $1" >&2; exit 1;;
-      *) args+="$1 "; shift 1;;
-    esac
-  done
-  if [ ${#args} -gt 0 ]; then
-    echo -e "${COLOR_WHITE_BOLD}NOTICE: The following arguments were ignored: ${args}"
-    echo -e "${COLOR_NONE}"
-  fi
-  if [ "${#CONTAINERS}" -eq 0 ]; then
-    REGISTERING_NEW_TASK_DEFINITION=false
-    if [ "$REVISION" == "hasnotbeenset" ]; then
-      REVISION="latest"
-    fi
-    gatherTaskDefinitionResourcesRequired
-  elif [ "${#CONTAINERS}" -ge 1 ] && [ "$REVISION" == "hasnotbeenset" ]; then
-    REGISTERING_NEW_TASK_DEFINITION=true
-    parseAllDockerRunCommands
+# For an existing task defintion, query for the sum cpu, memory, and ports all its containers require to run
+function calculateSumResourceRequirementsForExistingTask() {
+  CPU_REQUIREMENT=0
+  MEMORY_REQUIREMENT=0
+  EXISTING_TASK_HOST_PORTS=()
+  NUMBER_REGEX='^[0-9]+$'
+  if [ ! "$REVISION" == "latest" ] && [[ $REVISION =~ $NUMBER_REGEX ]]; then
+    TASK_NAME_WITH_REVISION="$TASK_NAME"":""$REVISION"
   else
-    echo "ERROR: Only one of the following flags should be used: One or more '--container <DOCKER RUN COMMAND>' flags to register a new task definition -OR- a single '--revision <NUMBER>' flag in order to run an existing task definition. Omitting both tags assumes you want to use an existing task defintion and the latest revision of that task"
+    TASK_NAME_WITH_REVISION="$TASK_NAME"
+  fi
+  TASK_DEFINITION_INFO=$(aws ecs describe-task-definition --task-definition "$TASK_NAME_WITH_REVISION" --region "$AWS_REGION" 2>/dev/null)
+  if [ $? -eq 0 ]; then
+    TASK_DEFINITION_INFO=$(echo $TASK_DEFINITION_INFO | jq '.taskDefinition.containerDefinitions')
+  else
+    echo "ERROR! The revision number specifed does not exist"
+    exit 2
+  fi
+  TASK_DEFINITION_COUNT=$(echo "$TASK_DEFINITION_INFO" | jq '. | length')
+  for (( TASK_DEFINITION_INDEX=0; TASK_DEFINITION_INDEX<TASK_DEFINITION_COUNT; TASK_DEFINITION_INDEX++ )); do
+    THIS_TASK_DEFINITION=$(echo "$TASK_DEFINITION_INFO" | jq '.['"$TASK_DEFINITION_INDEX"']')
+    THIS_CPU_REQUIREMENT=$(echo "$THIS_TASK_DEFINITION" | jq '.cpu')
+    CPU_REQUIREMENT=$(($CPU_REQUIREMENT + $THIS_CPU_REQUIREMENT))
+    THIS_MEMORY_REQUIREMENT=$(echo "$THIS_TASK_DEFINITION" | jq '.memory')
+    MEMORY_REQUIREMENT=$(($MEMORY_REQUIREMENT + $THIS_MEMORY_REQUIREMENT))
+    THIS_PORT_MAPPINGS=$(echo "$THIS_TASK_DEFINITION" | jq '.portMappings')
+    PORT_MAPPING_COUNT=$(echo "$THIS_PORT_MAPPINGS" | jq '. | length')
+    for (( PORT_MAPPING_INDEX=0; PORT_MAPPING_INDEX<PORT_MAPPING_COUNT; PORT_MAPPING_INDEX++ )); do
+      EXISTING_TASK_HOST_PORTS+=($(echo "$THIS_PORT_MAPPINGS" | jq '.['"$PORT_MAPPING_INDEX"'].hostPort'))
+    done
+  done
+}
+
+# For a new task definition, sum the cpu and memory requirements of the `docker run` commands provided
+function calculateSumResourceRequirementsForNewTask() {
+  for (( CONTAINER_DEFINITION_INDEX=0; CONTAINER_DEFINITION_INDEX<CONTAINER_DEFINITION_COUNT; CONTAINER_DEFINITION_INDEX++ )); do
+    CPU_REQUIREMENT=$(($CPU_REQUIREMENT + ${CONTAINER_DEFINITIONS[$CONTAINER_DEFINITION_INDEX,cpu]}))
+    MEMORY_REQUIREMENT=$(($MEMORY_REQUIREMENT + ${CONTAINER_DEFINITIONS[$CONTAINER_DEFINITION_INDEX,memory]}))
+  done
+}
+
+# Total up the cpu and memory requirements for the task the user requested
+function calculateSumResourceRequirementsForTask() {
+  if [ "$CREATING_NEW_TASK_DEFINITION" == true ]; then
+    calculateSumResourceRequirementsForNewTask
+  else
+    calculateSumResourceRequirementsForExistingTask
   fi
 }
 
-# Break Docker run statement into individual variables
-function parseAllDockerRunCommands() {
-  declare -g -A CONTAINER_DEFINITIONS
-  CONTAINER_DEFINITION_MAX_INDEX=0
-  for CONTAINER in "${CONTAINERS[@]}"; do
-    parseDockerRunCommand $CONTAINER
-    CONTAINER_DEFINITION_MAX_INDEX=$(($CONTAINER_DEFINITION_MAX_INDEX + 1))
-  done
+# Check if a given EC2 instance's remaining cpu and memory resources will allow a task definition to run
+function checkIfInstanceSuitsTask() {
+  if [ $THIS_INSTANCE_CPU_REMAINING -ge $CPU_REQUIREMENT ] && [ $THIS_INSTANCE_MEMORY_REMAINING -ge $MEMORY_REQUIREMENT ]; then
+    INSTANCE_SUITS_TASK="$THIS_INSTANCE_ARN"
+    break
+  fi
 }
 
-function parseDockerRunCommand() {
-  ARGS=()
-  THIS_NAME=""
-  THIS_PORT_MAPPINGS=()
-  THIS_CPU=""
-  THIS_MEMORY=""
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      --name) THIS_NAME=("$2"); shift 2;;
-      -p) THIS_PORT_MAPPINGS+=("$2"); shift 2;;
-      --publish) THIS_PORT_MAPPINGS+=("$2"); shift 2;;
-      -c) THIS_CPU=($(($2 * $CPU_COEF))); shift 2;;
-      --cpu) THIS_CPU=($(($2 * $CPU_COEF))); shift 2;;
-      -m) THIS_MEMORY=$(echo "scale=0; (($2 * $MEMORY_COEF) / 1)" | bc); shift 2;;
-      --memory) THIS_MEMORY=$(echo "scale=0; (($2 * $MEMORY_COEF) / 1)" | bc); shift 2;;
-      docker) shift 1;;
-      run) shift 1;;
-      -*) echo "unknown option: $1" >&2; exit 1;;
-      *) ARGS+=("$1"); shift 1;;
-    esac
-  done
-  for ARG in "${ARGS[@]}"; do
-    if [ -n "$ARG" ]; then
-      THIS_IMAGE=("$ARG")
-    fi
-  done
-  CONTAINER_DEFINITIONS[$CONTAINER_DEFINITION_MAX_INDEX,name]="$THIS_NAME"
-  CONTAINER_DEFINITIONS[$CONTAINER_DEFINITION_MAX_INDEX,image]="${THIS_IMAGE}"
-  CONTAINER_DEFINITIONS[$CONTAINER_DEFINITION_MAX_INDEX,cpu]="$THIS_CPU"
-  CONTAINER_DEFINITIONS[$CONTAINER_DEFINITION_MAX_INDEX,memory]="$THIS_MEMORY"
-  CONTAINER_DEFINITIONS[$CONTAINER_DEFINITION_MAX_INDEX,port-mappings]="${THIS_PORT_MAPPINGS[@]}"
-}
-
-function createAndRegisterNewInstanceIfNeeded() {
+# Create an EC2 instance and register it with the cluster
+function createAndRegisterNewInstance() {
   if [ "$INSTANCE_SUITS_TASK" == false ]; then
+    getMinimumSuitableInstanceType
     getNewUniqueInstanceName
     createNewInstanceOpenPortSpec
     COMMAND="./createEc2Instance.sh --name "$NEW_INSTANCE_NAME" --image "$AWS_EC2_AMI" --type "$MINIMUM_SUITABLE_INSTANCE_TYPE" --iam-role jenkins_instance --port 22 "$NEW_INSTANCE_OPEN_PORTS_SPEC" --startup-script installEcsAgentOnEc2Instance.sh"
@@ -122,191 +72,15 @@ function createAndRegisterNewInstanceIfNeeded() {
   fi
 }
 
-# Get a unique name in the form of `ecs-<CLUSTER_NAME>-<UNIQUE_NUMBER>` which
-# does not conflict with any existing EC2 key pair or EC2 security group names
-function getNewUniqueInstanceName() {
-  CLUSTER_STATUS=$(aws ecs describe-clusters --clusters "$CLUSTER_NAME" | jq '.clusters[0]')
-  CLUSTER_INSTANCE_COUNT=$(echo "$CLUSTER_STATUS" | jq '.registeredContainerInstancesCount')
-  CANDIDATE_INDEX=$(($CLUSTER_INSTANCE_COUNT + 1))
-  KEY_PAIRS=$(aws ec2 describe-key-pairs --region "$AWS_REGION" | jq '.KeyPairs')
-  KEY_PAIR_COUNT=$(echo "$KEY_PAIRS" | jq '. | length')
-  SECURITY_GROUPS=$(aws ec2 describe-security-groups --region "$AWS_REGION" | jq '.SecurityGroups')
-  SECURITY_GROUP_COUNT=$(echo "$SECURITY_GROUPS" | jq '. | length')
-  UNIQUE_NAME_FOUND=false
-  while [ "$UNIQUE_NAME_FOUND" == "false" ] ; do
-    UNIQUE_NAME_FOUND=true
-    INSTANCE_NAME_CANDIDATE=ecs-"$CLUSTER_NAME"-"$CANDIDATE_INDEX"
-    for (( KEY_PAIR_INDEX=0; KEY_PAIR_INDEX<KEY_PAIR_COUNT; KEY_PAIR_INDEX++ )); do
-      THIS_KEY_PAIR=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo "$KEY_PAIRS" | jq '.['"$KEY_PAIR_INDEX"'].KeyName'))
-      if [ "$INSTANCE_NAME_CANDIDATE" == "$THIS_KEY_PAIR" ]; then
-        UNIQUE_NAME_FOUND=false
-        break
-      fi
-    done
-    for (( SECURITY_GROUP_INDEX=0; SECURITY_GROUP_INDEX<SECURITY_GROUP_COUNT; SECURITY_GROUP_INDEX++ )); do
-      THIS_SECURITY_GROUP=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo "$SECURITY_GROUPS" | jq '.['"$SECURITY_GROUP_INDEX"'].GroupName'))
-      if [ "$INSTANCE_NAME_CANDIDATE" == "$THIS_SECURITY_GROUP" ]; then
-        UNIQUE_NAME_FOUND=false
-        break
-      fi
-    done
-    CANDIDATE_INDEX=$(($CANDIDATE_INDEX + 1))
-  done
-  NEW_INSTANCE_NAME="$INSTANCE_NAME_CANDIDATE"
-}
-
-function waitUntilInstanceRegisteredInCluster() {
-  while : ; do
-    CLUSTER_INSTANCES=$(aws ecs list-container-instances --cluster sample --region "$AWS_REGION" | jq '.containerInstanceArns')
-    CLUSTER_INSTANCE_COUNT=$(echo $CLUSTER_INSTANCES | jq '. | length')
-    for (( CLUSTER_INSTANCE_INDEX=0; CLUSTER_INSTANCE_INDEX<CLUSTER_INSTANCE_COUNT; CLUSTER_INSTANCE_INDEX++ )); do
-      CLUSTER_INSTANCE_ID=$(sed -e 's/^.*\///' -e 's/"$//' <<< $(echo "$CLUSTER_INSTANCES" | jq '.['"$CLUSTER_INSTANCE_INDEX"']'))
-      CLUSTER_EC2_INSTANCE_ID=$(sed -e 's/^"//' -e 's/"$//' <<< $(aws ecs describe-container-instances --cluster sample --container-instances "$CLUSTER_INSTANCE_ID" | jq '.containerInstances[0].ec2InstanceId'))
-      if [ "$CLUSTER_EC2_INSTANCE_ID" == "$NEW_INSTANCE_ID" ]; then
-        break 2
-      fi
-    done
-    sleep 2
-  done
-}
-
-function findNewInstanceInformation() {
-  EC2_INSTANCES=$(aws ec2 describe-instances --query 'Reservations[*].Instances[*].[State.Name,Tags[?Key==`Name`].Value,PublicIpAddress,InstanceId]')
-  INSTANCE_COUNT=$(echo $EC2_INSTANCES | jq '. | length')
-  for (( INSTANCE_INDEX=0; INSTANCE_INDEX<INSTANCE_COUNT; INSTANCE_INDEX++ )); do
-    THIS_INSTANCE=$(echo $EC2_INSTANCES | jq '.['"$INSTANCE_INDEX"'][0]')
-    THIS_INSTANCE_STATE=$(echo $THIS_INSTANCE | jq '.[0]')
-    THIS_INSTANCE_NAME=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo $THIS_INSTANCE | jq '.[1][0]'))
-    if [ "$THIS_INSTANCE_STATE" == \"running\" ] && [ "$THIS_INSTANCE_NAME" == "$NEW_INSTANCE_NAME" ]; then
-      THIS_INSTANCE_IP=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo $THIS_INSTANCE | jq '.[2]'))
-      THIS_INSTANCE_ID=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo $THIS_INSTANCE | jq '.[3]'))
-      break
-    fi
-  done
-  if [ -z "$THIS_INSTANCE_IP" ]; then
-    echo -e "${COLOR_RED_BOLD}ERROR: The instance could not be found"
-    echo -e "${COLOR_NONE}"
-    exit 2
-  else
-    NEW_INSTANCE_PUBLIC_IP=$THIS_INSTANCE_IP
-    NEW_INSTANCE_ID=$THIS_INSTANCE_ID
+# If the cluster specified does not exist, create it
+function createClusterIfDoesNotExist() {
+  CLUSTER_EXISTS=$(aws ecs describe-clusters --clusters "$CLUSTER_NAME" --region "$AWS_REGION" | jq '.clusters | length')
+  if [ "$CLUSTER_EXISTS" -eq 0 ]; then
+    ./createEcsCluster.sh --name "$CLUSTER_NAME" --region "$AWS_REGION"
   fi
 }
 
-function declareConstants() {
-  CPU_COEF=1024
-  MEMORY_COEF=926
-  AWS_EC2_AMI="ami-40142d25"
-}
-
-function calculateSumResourceRequirementsForTask() {
-  CPU_REQUIREMENT=$EXISTING_TASK_CPU_REQUIREMENT
-  MEMORY_REQUIREMENT=$EXISTING_TASK_MEMORY_REQUIREMENT
-  for (( CONTAINER_DEFINITIONS_INDEX=0; CONTAINER_DEFINITIONS_INDEX<CONTAINER_DEFINITION_MAX_INDEX; CONTAINER_DEFINITIONS_INDEX++ )); do
-    echo ${CONTAINER_DEFINITIONS[$CONTAINER_DEFINITIONS_INDEX,cpu]}
-    echo ${CONTAINER_DEFINITIONS[$CONTAINER_DEFINITIONS_INDEX,memory]}
-    CPU_REQUIREMENT=$(($CPU_REQUIREMENT + ${CONTAINER_DEFINITIONS[$CONTAINER_DEFINITIONS_INDEX,cpu]}))
-    MEMORY_REQUIREMENT=$(($CPU_REQUIREMENT + ${CONTAINER_DEFINITIONS[$CONTAINER_DEFINITIONS_INDEX,memory]}))
-  done
-#  for CPU_VALUE in "${CPU[@]}"; do
-#    CPU_REQUIREMENT=$(($CPU_REQUIREMENT + $CPU_VALUE))
-#  done
-#  for MEMORY_VALUE in "${MEMORY[@]}"; do
-#    MEMORY_REQUIREMENT=$(($MEMORY_REQUIREMENT + $MEMORY_VALUE))
-#  done
-}
-
-function findExistingSuitableInstanceInCluster() {
-  INSTANCE_SUITS_TASK=false
-  CONTAINER_INSTANCE_ARNS=$(aws ecs list-container-instances --cluster "$CLUSTER_NAME" --region "$AWS_REGION" | jq '.containerInstanceArns')
-  INSTANCE_COUNT=$(echo $CONTAINER_INSTANCE_ARNS | jq '. | length')
-  for (( INSTANCE_INDEX=0; INSTANCE_INDEX<INSTANCE_COUNT; INSTANCE_INDEX++ )); do
-    THIS_INSTANCE_ARN=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo "$CONTAINER_INSTANCE_ARNS" | jq '.['"$INSTANCE_INDEX"']'))
-    findRemainingResourcesOnInstance
-    checkIfInstanceSuitsTask
-  done
-}
-
-function findRemainingResourcesOnInstance() {
-  RESOURCES=$(aws ecs describe-container-instances --cluster "$CLUSTER_NAME" --container-instances "$THIS_INSTANCE_ARN" --region "$AWS_REGION" | jq '.containerInstances[0].remainingResources')
-  RESOURCE_COUNT=$(echo "$RESOURCES" | jq '. | length')
-  for (( RESOURCE_INDEX=0; RESOURCE_INDEX<RESOURCE_COUNT; RESOURCE_INDEX++ )); do
-    THIS_RESOURCE=$(echo "$RESOURCES" | jq '.['"$RESOURCE_INDEX"']')
-    THIS_RESOURCE_NAME=$(echo "$THIS_RESOURCE" | jq '.name')
-    if [ "$THIS_RESOURCE_NAME" == \"CPU\" ]; then
-      THIS_INSTANCE_CPU_REMAINING=$(echo "$THIS_RESOURCE" | jq '.integerValue')
-    elif [ "$THIS_RESOURCE_NAME" == \"MEMORY\" ]; then
-      THIS_INSTANCE_MEMORY_REMAINING=$(echo "$THIS_RESOURCE" | jq '.integerValue')
-    fi
-  done
-}
-
-function checkIfInstanceSuitsTask() {
-  if [ $THIS_INSTANCE_CPU_REMAINING -ge $CPU_REQUIREMENT ] && [ $THIS_INSTANCE_MEMORY_REMAINING -ge $MEMORY_REQUIREMENT ]; then
-    INSTANCE_SUITS_TASK="$THIS_INSTANCE_ARN"
-    break
-  fi
-}
-
-function getMinimumSuitableInstanceType() {
-  . ./awsT3InstanceSpecs.sh
-  MINIMUM_SUITABLE_INSTANCE_TYPE=false
-  if [ "$INSTANCE_SUITS_TASK" == false ]; then
-    for AWS_T3_INSTANCE_SPEC in ${!AWS_T3_INSTANCE_SPEC@}; do
-      if [ ${AWS_T3_INSTANCE_SPEC[cpu]} -ge $CPU_REQUIREMENT ] && [ ${AWS_T3_INSTANCE_SPEC[memory]} -ge $MEMORY_REQUIREMENT ]; then
-        MINIMUM_SUITABLE_INSTANCE_TYPE=${AWS_T3_INSTANCE_SPEC[name]}
-        break
-      fi
-    done
-  fi
-}
-
-function registerEcsTaskDefinitionIfNeeded() {
-  if [ "$REGISTERING_NEW_TASK_DEFINITION" == true ]; then
-    validateDockerImages
-    createTaskDefinitionJson
-    registerTaskDefinition
-  fi
-}
-
-function launchTask() {
-  if [ "$REVISION" == "hasnotbeenset" ] || [ "$REVISION" == "latest" ] ; then
-    ECS_LAUNCH_STATUS=$(aws ecs run-task --cluster "$CLUSTER_NAME" --task-definition "$TASK_NAME" --region "$AWS_REGION")
-  else
-    ECS_LAUNCH_STATUS=$(aws ecs run-task --cluster "$CLUSTER_NAME" --task-definition "$TASK_NAME":"$REVISION" --region "$AWS_REGION")
-  fi
-}
-
-function exitIfScriptFailed() {
-  if [ $? -eq 2 ]; then
-    exit 2
-  fi
-}
-
-function gatherTaskDefinitionResourcesRequired() {
-  NUMBER_REGEX='^[0-9]+$'
-  if [ ! "$REVISION" == "latest" ] && [[ $REVISION =~ $NUMBER_REGEX ]]; then
-    TASK_NAME_WITH_REVISION="$TASK_NAME"":""$REVISION"
-  else
-    TASK_NAME_WITH_REVISION="$TASK_NAME"
-  fi
-  TASK_DEFINITION_INFO=$(aws ecs describe-task-definition --task-definition "$TASK_NAME_WITH_REVISION" --region "$AWS_REGION" 2>/dev/null)
-  # TODO: This is where port mappings should be retrieved from when using existing task definitions
-  if [ $? -eq 0 ]; then
-    TASK_DEFINITION_INFO=$(echo $TASK_DEFINITION_INFO | jq '.taskDefinition.containerDefinitions')
-  else
-    echo "ERROR! The revision number specifed does not exist"
-    exit 2
-  fi
-  CONTAINER_DEFINITION_COUNT=$(echo "$TASK_DEFINITION_INFO" | jq '. | length')
-  for (( CONTAINER_DEFINITION_INDEX=0; CONTAINER_DEFINITION_INDEX<CONTAINER_DEFINITION_COUNT; CONTAINER_DEFINITION_INDEX++ )); do
-    THIS_CONTAINER_CPU_REQUIREMENT=$(echo "$TASK_DEFINITION_INFO" | jq '.['"$CONTAINIER_DEFINITION_INDEX"'].cpu')
-    THIS_CONTAINER_MEMORY_REQUIREMENT=$(echo "$TASK_DEFINITION_INFO" | jq '.['"$CONTAINIER_DEFINITION_INDEX"'].memory')
-    EXISTING_TASK_CPU_REQUIREMENT+=($THIS_CONTAINER_CPU_REQUIREMENT)
-    EXISTING_TASK_MEMORY_REQUIREMENT+=($THIS_CONTAINER_MEMORY_REQUIREMENT)
-  done
-}
-
+# Create a string recognized by the `createEc2Instance.sh` script which will open the ports necessary to run the task
 function createNewInstanceOpenPortSpec() {
   NEW_INSTANCE_OPEN_PORTS_SPEC=""
   for PORT_MAPPING in "${PORT_MAPPINGS[@]}"; do
@@ -314,6 +88,7 @@ function createNewInstanceOpenPortSpec() {
   done
 }
 
+# Create a JSON structure for use in the AWS command `aws ecs register-task-definition`
 function createTaskDefinitionJson() {
 	TASK_DEFINITION=$(cat <<-EOF
 		{
@@ -404,75 +179,69 @@ function createTaskDefinitionJson() {
 		}
 	EOF
   )
-  echo "$TASK_DEFINITION"
-  exit 2
 }
 
-function registerTaskDefinition() {
-  aws ecs register-task-definition --cli-input-json "$TASK_DEFINITION" --region "$AWS_REGION" >> /dev/null
+# Declare all constants for later use
+function declareConstants() {
+  AWS_EC2_AMI="ami-40142d25"
+  CPU_COEF=1024
+  MEMORY_COEF=926
+  defineColorPalette
 }
 
-function validateDockerImages() {
-  $(aws ecr get-login --no-include-email --region us-east-2) >/dev/null 2>/dev/null
-  IMAGE_INDEX=0
-  for CONTAINER_DEFINITIONS in ${!CONTAINER_DEFINITIONS@}; do
-    validateDockerImage
-    IMAGE_INDEX=$((IMAGE_INDEX + 1))
-  done
+# Declare defaults for optional input values / flags
+function declareInputDefaults() {
+  AWS_REGION="us-east-2"
+  OVERWRITE_ECR=false
+  REVISION="hasnotbeenset"
 }
 
-function validateDockerImage() {
-  THIS_IMAGE="${CONTAINER_DEFINITIONS[$IMAGE_INDEX,image]}"
-  splitImageIntoParts
-  if [ "$USER_SPECIFIED_ECR" == true ]; then
-    validateEcrDockerImage
-  else
-    validateLocalDockerOrDockerHubImage
-  fi
+# Define all colors used for output
+function defineColorPalette() {
+  COLOR_RED='\033[0;91m'
+  COLOR_WHITE_BOLD='\033[1;97m'
+  COLOR_NONE='\033[0m'
 }
 
-function validateLocalDockerOrDockerHubImage() {
-  DOCKER_IMAGES_EMPTY_OUTPUT_SIZE=84
-  IMAGE_EXISTS_LOCALLY=false
-  IMAGE_EXISTS_ON_DOCKER_HUB=false
-  LOCAL_DOCKER_IMAGES=$(docker images "$THIS_IMAGE")
-  if [ ! "${#LOCAL_DOCKER_IMAGES}" -eq $DOCKER_IMAGES_EMPTY_OUTPUT_SIZE ]; then
-    IMAGE_EXISTS_LOCALLY=true
-  fi
-  if [ "$IMAGE_EXISTS_LOCALLY" == true ]; then
-    if [ "$OVERWRITE_ECR" == false ]; then
-      exitIfEcrImageTagComboAlreadyExists
-    fi
-    if [ "$REPO_EXISTS_IN_ECR" == false ]; then
-      ECR_REPOSITORY_URI=$(sed -e 's/^"//' -e 's/"$//' <<< $(aws ecr create-repository --repository-name "$THIS_IMAGE_NAME" --region "$AWS_REGION" | jq '.repository.repositoryUri'))
+# Based on the user input and what resources are lying around in the cluster specified, check if we need to create a new EC2 instance
+function determineIfCreatingNewEc2Instance() {
+  CLUSTER_EXISTS=$(aws ecs describe-clusters --clusters "$CLUSTER_NAME" --region "$AWS_REGION" | jq '.clusters | length')
+  if [ $CLUSTER_EXISTS -gt 0 ]; then 
+    findExistingSuitableInstanceInCluster
+    if [ "$INSTANCE_SUITS_TASK" == false ]; then
+      CREATING_NEW_EC2_INSTANCE=true
     else
-      ECR_REPOSITORY_URI=$(sed -e 's/^"//' -e 's/"$//' <<< $(aws ecr describe-repositories --repository "$THIS_IMAGE_NAME" --region "$AWS_REGION" | jq '.repositories[0].repositoryUri'))
+      CREATING_NEW_EC2_INSTANCE=false
     fi
-    THIS_IMAGE_ECR="$ECR_REPOSITORY_URI":"$THIS_IMAGE_TAG"
-    docker tag "$THIS_IMAGE" "$THIS_IMAGE_ECR"
-    docker push "$THIS_IMAGE_ECR" >> /dev/null
-    CONTAINER_DEFINITIONS[$IMAGE_INDEX,image]="$THIS_IMAGE_ECR"
   else
-    # TODO: Check if image exists on Docker Hub
-    echo Image does not exist locally
+    CREATING_NEW_EC2_INSTANCE=true
   fi
 }
 
-function splitImageIntoParts() {
-  if [[ "$THIS_IMAGE" =~ ^.*:.*$ ]]; then
-    THIS_IMAGE_NAME="${THIS_IMAGE%:*}"
-    THIS_IMAGE_TAG="${THIS_IMAGE#*:}"
+# Based on the user input, check if we are creating a new task definition, using an existing one, or if the user input is invalid
+function determineIfCreatingNewTaskDefinition() {
+  if [ "${#DOCKER_RUN_COMMANDS}" -eq 0 ]; then
+    CREATING_NEW_TASK_DEFINITION=false
+    if [ "$REVISION" == "hasnotbeenset" ]; then
+      REVISION="latest"
+    fi
+  elif [ "${#DOCKER_RUN_COMMANDS}" -ge 1 ] && [ "$REVISION" == "hasnotbeenset" ]; then
+    CREATING_NEW_TASK_DEFINITION=true
   else
-    THIS_IMAGE_NAME="$THIS_IMAGE"
-    THIS_IMAGE_TAG="latest"
-    THIS_IMAGE="$THIS_IMAGE_NAME"":""$THIS_IMAGE_TAG"
-  fi
-  USER_SPECIFIED_ECR=false
-  if [[ "$THIS_IMAGE" =~ ^ecr/.* ]]; then
-    USER_SPECIFIED_ECR=true
+    echo "ERROR: Only one of the following flags should be used: One or more '--container <DOCKER RUN COMMAND>' flags to register a new task definition -OR- a single '--revision <NUMBER>' flag in order to run an existing task definition. Omitting both tags assumes you want to use an existing task defintion and the latest revision of that task"
+    exit 2
   fi
 }
 
+# Determine whether the ECS task being launched requires a new task definition to be registered and/or a new EC2 instance to run on
+function determineLaunchType() {
+  determineIfCreatingNewTaskDefinition
+  calculateSumResourceRequirementsForTask
+  determineIfCreatingNewEc2Instance
+  setLaunchType
+}
+
+# Exit if the `--overwrite-ecr` flag was not used and the `docker push` to ECR required to run the task would overwrite ECR
 function exitIfEcrImageTagComboAlreadyExists() {
   REPO_EXISTS_IN_ECR=false
   ECR_REPOS=$(aws ecr describe-repositories --region "$AWS_REGION" | jq '.repositories')
@@ -497,6 +266,310 @@ function exitIfEcrImageTagComboAlreadyExists() {
   done
 }
 
+# Exit this script if the last command ran failed
+function exitIfScriptFailed() {
+  if [ $? -eq 2 ]; then
+    exit 2
+  fi
+}
+
+# Check all the EC2 instances in the cluster specified to see if any of the
+# instances will support the task definitions minimum resource requirements
+function findExistingSuitableInstanceInCluster() {
+  INSTANCE_SUITS_TASK=false
+  CONTAINER_INSTANCE_ARNS=$(aws ecs list-container-instances --cluster "$CLUSTER_NAME" --region "$AWS_REGION" | jq '.containerInstanceArns')
+  INSTANCE_COUNT=$(echo $CONTAINER_INSTANCE_ARNS | jq '. | length')
+  for (( INSTANCE_INDEX=0; INSTANCE_INDEX<INSTANCE_COUNT; INSTANCE_INDEX++ )); do
+    THIS_INSTANCE_ARN=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo "$CONTAINER_INSTANCE_ARNS" | jq '.['"$INSTANCE_INDEX"']'))
+    findRemainingResourcesOnInstance
+    checkIfInstanceSuitsTask
+  done
+}
+
+# Having just created a new EC2 instance, query AWS for its ID and public IP
+function findNewInstanceInformation() {
+  EC2_INSTANCES=$(aws ec2 describe-instances --query 'Reservations[*].Instances[*].[State.Name,Tags[?Key==`Name`].Value,PublicIpAddress,InstanceId]')
+  INSTANCE_COUNT=$(echo $EC2_INSTANCES | jq '. | length')
+  for (( INSTANCE_INDEX=0; INSTANCE_INDEX<INSTANCE_COUNT; INSTANCE_INDEX++ )); do
+    THIS_INSTANCE=$(echo $EC2_INSTANCES | jq '.['"$INSTANCE_INDEX"'][0]')
+    THIS_INSTANCE_STATE=$(echo $THIS_INSTANCE | jq '.[0]')
+    THIS_INSTANCE_NAME=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo $THIS_INSTANCE | jq '.[1][0]'))
+    if [ "$THIS_INSTANCE_STATE" == \"running\" ] && [ "$THIS_INSTANCE_NAME" == "$NEW_INSTANCE_NAME" ]; then
+      THIS_INSTANCE_IP=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo $THIS_INSTANCE | jq '.[2]'))
+      THIS_INSTANCE_ID=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo $THIS_INSTANCE | jq '.[3]'))
+      break
+    fi
+  done
+  if [ -z "$THIS_INSTANCE_IP" ]; then
+    echo -e "${COLOR_RED_BOLD}ERROR: The instance could not be found"
+    echo -e "${COLOR_NONE}"
+    exit 2
+  else
+    NEW_INSTANCE_PUBLIC_IP=$THIS_INSTANCE_IP
+    NEW_INSTANCE_ID=$THIS_INSTANCE_ID
+  fi
+}
+
+# Query a given EC2 instance for its remaining cpu and memory resources
+function findRemainingResourcesOnInstance() {
+  RESOURCES=$(aws ecs describe-container-instances --cluster "$CLUSTER_NAME" --container-instances "$THIS_INSTANCE_ARN" --region "$AWS_REGION" | jq '.containerInstances[0].remainingResources')
+  RESOURCE_COUNT=$(echo "$RESOURCES" | jq '. | length')
+  for (( RESOURCE_INDEX=0; RESOURCE_INDEX<RESOURCE_COUNT; RESOURCE_INDEX++ )); do
+    THIS_RESOURCE=$(echo "$RESOURCES" | jq '.['"$RESOURCE_INDEX"']')
+    THIS_RESOURCE_NAME=$(echo "$THIS_RESOURCE" | jq '.name')
+    if [ "$THIS_RESOURCE_NAME" == \"CPU\" ]; then
+      THIS_INSTANCE_CPU_REMAINING=$(echo "$THIS_RESOURCE" | jq '.integerValue')
+    elif [ "$THIS_RESOURCE_NAME" == \"MEMORY\" ]; then
+      THIS_INSTANCE_MEMORY_REMAINING=$(echo "$THIS_RESOURCE" | jq '.integerValue')
+    fi
+  done
+}
+
+# Based on the cpu and memory requirements of the task, find the smallest
+# instance type in the T3 family of EC2 instances which is compatible
+function getMinimumSuitableInstanceType() {
+  . ./awsT3InstanceSpecs.sh
+  MINIMUM_SUITABLE_INSTANCE_TYPE=false
+  if [ "$INSTANCE_SUITS_TASK" == false ]; then
+    for AWS_T3_INSTANCE_SPEC in ${!AWS_T3_INSTANCE_SPEC@}; do
+      if [ ${AWS_T3_INSTANCE_SPEC[cpu]} -ge $CPU_REQUIREMENT ] && [ ${AWS_T3_INSTANCE_SPEC[memory]} -ge $MEMORY_REQUIREMENT ]; then
+        MINIMUM_SUITABLE_INSTANCE_TYPE=${AWS_T3_INSTANCE_SPEC[name]}
+        break
+      fi
+    done
+  fi
+}
+
+# Get a unique name in the form of `ecs-<CLUSTER_NAME>-<UNIQUE_NUMBER>` which
+# does not conflict with any existing EC2 key pair or EC2 security group names
+function getNewUniqueInstanceName() {
+  CLUSTER_STATUS=$(aws ecs describe-clusters --clusters "$CLUSTER_NAME" | jq '.clusters[0]')
+  CLUSTER_INSTANCE_COUNT=$(echo "$CLUSTER_STATUS" | jq '.registeredContainerInstancesCount')
+  CANDIDATE_INDEX=$(($CLUSTER_INSTANCE_COUNT + 1))
+  KEY_PAIRS=$(aws ec2 describe-key-pairs --region "$AWS_REGION" | jq '.KeyPairs')
+  KEY_PAIR_COUNT=$(echo "$KEY_PAIRS" | jq '. | length')
+  SECURITY_GROUPS=$(aws ec2 describe-security-groups --region "$AWS_REGION" | jq '.SecurityGroups')
+  SECURITY_GROUP_COUNT=$(echo "$SECURITY_GROUPS" | jq '. | length')
+  UNIQUE_NAME_FOUND=false
+  while [ "$UNIQUE_NAME_FOUND" == "false" ] ; do
+    UNIQUE_NAME_FOUND=true
+    INSTANCE_NAME_CANDIDATE=ecs-"$CLUSTER_NAME"-"$CANDIDATE_INDEX"
+    for (( KEY_PAIR_INDEX=0; KEY_PAIR_INDEX<KEY_PAIR_COUNT; KEY_PAIR_INDEX++ )); do
+      THIS_KEY_PAIR=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo "$KEY_PAIRS" | jq '.['"$KEY_PAIR_INDEX"'].KeyName'))
+      if [ "$INSTANCE_NAME_CANDIDATE" == "$THIS_KEY_PAIR" ]; then
+        UNIQUE_NAME_FOUND=false
+        break
+      fi
+    done
+    for (( SECURITY_GROUP_INDEX=0; SECURITY_GROUP_INDEX<SECURITY_GROUP_COUNT; SECURITY_GROUP_INDEX++ )); do
+      THIS_SECURITY_GROUP=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo "$SECURITY_GROUPS" | jq '.['"$SECURITY_GROUP_INDEX"'].GroupName'))
+      if [ "$INSTANCE_NAME_CANDIDATE" == "$THIS_SECURITY_GROUP" ]; then
+        UNIQUE_NAME_FOUND=false
+        break
+      fi
+    done
+    CANDIDATE_INDEX=$(($CANDIDATE_INDEX + 1))
+  done
+  NEW_INSTANCE_NAME="$INSTANCE_NAME_CANDIDATE"
+}
+
+# Handle user input
+function handleInput() {
+  declareInputDefaults
+  parseInputFlags "$@"
+  notifyUserOfUnknownInputArgs
+  parseAllDockerRunCommands
+}
+
+function launchTask() {
+  if [ "$REVISION" == "hasnotbeenset" ] || [ "$REVISION" == "latest" ] ; then
+    ECS_LAUNCH_STATUS=$(aws ecs run-task --cluster "$CLUSTER_NAME" --task-definition "$TASK_NAME" --region "$AWS_REGION")
+  else
+    ECS_LAUNCH_STATUS=$(aws ecs run-task --cluster "$CLUSTER_NAME" --task-definition "$TASK_NAME":"$REVISION" --region "$AWS_REGION")
+  fi
+}
+
+# If the user provides input the script does not understand, show them which part is being ignored
+function notifyUserOfUnknownInputArgs() {
+  if [ ${#ARGS} -gt 0 ]; then
+    echo -e "${COLOR_WHITE_BOLD}NOTICE: The following arguments were ignored: ${ARGS}"
+    echo -e "${COLOR_NONE}"
+  fi
+}
+
+# Hop around various AWS commands before finding the security group of
+# the container instance's corresponding EC2 instance of the ECS task
+function huntDownSecurityGroupOfTask() {
+  CONTAINER_INSTANCE_ARN_OF_TASK=$(echo "$ECS_LAUNCH_STATUS" | jq '.tasks[0].containerInstanceArn')
+  CONTAINER_INSTANCE_ID_OF_TASK=$(sed -e 's/^.*\///' -e 's/"$//' <<< $(echo "$CONTAINER_INSTANCE_ARN_OF_TASK"))
+  EC2_ID_OF_TASK=$(sed -e 's/^"//' -e 's/"$//' <<< $(aws ecs describe-container-instances --cluster "$CLUSTER_NAME" --container-instances "$CONTAINER_INSTANCE_ID_OF_TASK" --region "$AWS_REGION" | jq '.containerInstances[0].ec2InstanceId'))
+  CONTAINER_INSTANCE_TASK_COUNT=$(aws ecs describe-container-instances --cluster "$CLUSTER_NAME" --container-instances "$CONTAINER_INSTANCE_ID_OF_TASK" --region "$AWS_REGION" | jq '.containerInstances[0].runningTasksCount')
+  SECURITY_GROUP_OF_TASK=$(sed -e 's/^"//' -e 's/"$//' <<< $(aws ec2 describe-instances --instance-ids "$EC2_ID_OF_TASK" | jq '.Reservations[0].Instances[0].NetworkInterfaces[0].Groups[0].GroupId'))
+}
+
+# If a container instance is about to run a new task and has no tasks currently
+# running on it, revoke all the ingress port rules on the matching security group
+function revokeAllSecurityRules() {
+  if [ $CONTAINER_INSTANCE_TASK_COUNT -eq 0 ]; then
+    SECURITY_GROUP_PORTS_ALLOWED=$(aws ec2 describe-security-groups --group-ids "$SECURITY_GROUP_OF_TASK" --region "$AWS_REGION" | jq '.SecurityGroups[0].IpPermissions')
+    PORT_ALLOWED_COUNT=$(echo "$SECURITY_GROUP_PORTS_ALLOWED" | jq '. | length')
+    for (( PORT_ALLOWED_INDEX=0; PORT_ALLOWED_INDEX<PORT_ALLOWED_COUNT; PORT_ALLOWED_INDEX++ )); do
+      PORT_ALLOWED=$(echo "$SECURITY_GROUP_PORTS_ALLOWED" | jq '.['"$PORT_ALLOWED_INDEX"']')
+      FROM_PORT=$(echo "$PORT_ALLOWED" | jq '.FromPort')
+      TO_PORT=$(echo "$PORT_ALLOWED" | jq '.ToPort')
+      for (( PORT_INDEX=FROM_PORT; PORT_INDEX<=TO_PORT; PORT_INDEX++ )); do
+        aws ec2 revoke-security-group-ingress --group-id "$SECURITY_GROUP_OF_TASK" --protocol tcp --port $PORT_INDEX --cidr 0.0.0.0/0 --region "$AWS_REGION"
+      done
+    done
+  fi
+}
+
+# Authorize the necessary ports for an ECS task
+function authorizeNecessarySecurityRulesForTask() {
+  if [ "${#EXISTING_TASK_HOST_PORTS[@]}" -gt 0 ]; then
+    for PORT in "${EXISTING_TASK_HOST_PORTS[@]}"; do
+      aws ec2 authorize-security-group-ingress --group-id "$SECURITY_GROUP_OF_TASK" --protocol tcp --port "$PORT" --cidr 0.0.0.0/0 --region "$AWS_REGION" 2>/dev/null
+    done
+  else
+    for PORT_MAPPING in "${PORT_MAPPINGS[@]}"; do
+      PORT_TO_AUTHORIZE=$(sed -e 's/:.*//' <<< $(echo "$PORT_MAPPING"))
+      aws ec2 authorize-security-group-ingress --group-id "$SECURITY_GROUP_OF_TASK" --protocol tcp --port "$PORT_TO_AUTHORIZE" --cidr 0.0.0.0/0 --region "$AWS_REGION" 2>/dev/null
+    done
+  fi
+}
+
+# Change the ingress port security rules for an existing container instance to match the requirements of the task running on it
+function editSecurityRulesForContainerPorts() {
+  huntDownSecurityGroupOfTask
+  revokeAllSecurityRules
+  authorizeNecessarySecurityRulesForTask
+}
+
+# Parse all the `docker run` commands provided, if any
+function parseAllDockerRunCommands() {
+  declare -g -A CONTAINER_DEFINITIONS
+  CONTAINER_DEFINITION_COUNT=0
+  for DOCKER_RUN_COMMAND in "${DOCKER_RUN_COMMANDS[@]}"; do
+    parseDockerRunCommand $DOCKER_RUN_COMMAND
+    CONTAINER_DEFINITION_COUNT=$(($CONTAINER_DEFINITION_COUNT + 1))
+  done
+}
+
+# Parse a single `docker run` command
+function parseDockerRunCommand() {
+  THIS_PORT_MAPPINGS=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --name) THIS_NAME="$2"; shift 2;;
+      -p) THIS_PORT_MAPPINGS+=("$2"); shift 2;;
+      --publish) THIS_PORT_MAPPINGS+=("$2"); shift 2;;
+      -c) THIS_CPU=$(($2 * $CPU_COEF)); shift 2;;
+      --cpu) THIS_CPU=$(($2 * $CPU_COEF)); shift 2;;
+      -m) THIS_MEMORY=$(echo "scale=0; (($2 * $MEMORY_COEF) / 1)" | bc); shift 2;;
+      --memory) THIS_MEMORY=$(echo "scale=0; (($2 * $MEMORY_COEF) / 1)" | bc); shift 2;;
+      docker) shift 1;;
+      run) shift 1;;
+      -*) echo "unknown option: $1" >&2; exit 1;;
+      *) ARGS+=("$1"); shift 1;;
+    esac
+  done
+  for ARG in "${ARGS[@]}"; do
+    if [ -n "$ARG" ]; then
+      THIS_IMAGE=("$ARG")
+    fi
+  done
+  CONTAINER_DEFINITIONS[$CONTAINER_DEFINITION_COUNT,name]="$THIS_NAME"
+  CONTAINER_DEFINITIONS[$CONTAINER_DEFINITION_COUNT,image]="$THIS_IMAGE"
+  CONTAINER_DEFINITIONS[$CONTAINER_DEFINITION_COUNT,cpu]="$THIS_CPU"
+  CONTAINER_DEFINITIONS[$CONTAINER_DEFINITION_COUNT,memory]="$THIS_MEMORY"
+  CONTAINER_DEFINITIONS[$CONTAINER_DEFINITION_COUNT,port-mappings]="${THIS_PORT_MAPPINGS[@]}"
+}
+
+# Divide the user input into variables
+function parseInputFlags() {
+  DOCKER_RUN_COMMANDS=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      # Required inputs
+      --cluster) CLUSTER_NAME="$2"; shift 2;;
+      --task) TASK_NAME="$2"; shift 2;;
+      # Only one of the following inputs can be used (neither defaults to `--revision=latest`)
+      --container) DOCKER_RUN_COMMANDS+=("$2"); shift 2;;
+      --revision) REVISION=("$2"); shift 2;;
+      # Optional inputs
+      --overwrite-ecr) OVERWRITE_ECR=true; shift 1;;
+      --region) AWS_REGION="$2"; shift 2;;
+      # Optional inputs yet to be implemented
+      --skip-output) NO_OUTPUT=true; shift 1;;
+      -h) HELP_WANTED=true; shift 1;;
+      --help) HELP_WANTED=true; shift 1;;
+      -*) echo "unknown option: $1" >&2; exit 1;;
+      *) ARGS+="$1 "; shift 1;;
+    esac
+  done
+}
+
+# Register a new task definition with ECS
+function registerTaskDefinition() {
+  validateDockerImages
+  createTaskDefinitionJson
+  aws ecs register-task-definition --cli-input-json "$TASK_DEFINITION" --region "$AWS_REGION" >> /dev/null
+}
+
+# Determine which "launch type" is required (based on the user input and the status of the cluster)
+function setLaunchType() {
+  if [ "$CREATING_NEW_TASK_DEFINITION" == true ] && [ "$CREATING_NEW_EC2_INSTANCE" == true ]; then
+    LAUNCH_TYPE="new-everything"
+  elif [ "$CREATING_NEW_TASK_DEFINITION" == true ] && [ "$CREATING_NEW_EC2_INSTANCE" == false ]; then
+    LAUNCH_TYPE="new-task-definition"
+  elif [ "$CREATING_NEW_TASK_DEFINITION" == false ] && [ "$CREATING_NEW_EC2_INSTANCE" == true ]; then
+    LAUNCH_TYPE="new-instance"
+  elif [ "$CREATING_NEW_TASK_DEFINITION" == false ] && [ "$CREATING_NEW_EC2_INSTANCE" == false ]; then
+    LAUNCH_TYPE="existing-resources"
+  else
+    echo "ERROR: A valid launch type could not be determined"
+    exit 2
+  fi
+}
+
+# Separate the Docker image tag from the Docker image name for maximum scripting flexibility
+function splitImageIntoParts() {
+  if [[ "$THIS_IMAGE" =~ ^.*:.*$ ]]; then
+    THIS_IMAGE_NAME="${THIS_IMAGE%:*}"
+    THIS_IMAGE_TAG="${THIS_IMAGE#*:}"
+  else
+    THIS_IMAGE_NAME="$THIS_IMAGE"
+    THIS_IMAGE_TAG="latest"
+    THIS_IMAGE="$THIS_IMAGE_NAME"":""$THIS_IMAGE_TAG"
+  fi
+  USER_SPECIFIED_ECR=false
+  if [[ "$THIS_IMAGE" =~ ^ecr/.* ]]; then
+    USER_SPECIFIED_ECR=true
+  fi
+}
+
+# Validate all Docker images specified in a task defintion or `docker run` command exist
+function validateDockerImages() {
+  $(aws ecr get-login --no-include-email --region us-east-2) >/dev/null 2>/dev/null
+  IMAGE_INDEX=0
+  for CONTAINER_DEFINITIONS in ${!CONTAINER_DEFINITIONS@}; do
+    validateDockerImage
+    IMAGE_INDEX=$((IMAGE_INDEX + 1))
+  done
+}
+
+# Validate a Docker image specified in a task definition or `docker run` command exists
+function validateDockerImage() {
+  THIS_IMAGE="${CONTAINER_DEFINITIONS[$IMAGE_INDEX,image]}"
+  splitImageIntoParts
+  if [ "$USER_SPECIFIED_ECR" == true ]; then
+    validateEcrDockerImage
+  else
+    validateLocalDockerOrDockerHubImage
+  fi
+}
+
+# Validate a Docker image exists in ECR
 function validateEcrDockerImage() {
   IMAGE_EXISTS_IN_ECR=false
   ECR_REPOS=$(aws ecr describe-repositories --region "$AWS_REGION" | jq '.repositories')
@@ -528,14 +601,66 @@ function validateEcrDockerImage() {
   fi
 }
 
+# Validate a Docker image exists either locally or on Docker Hub
+function validateLocalDockerOrDockerHubImage() {
+  DOCKER_IMAGES_EMPTY_OUTPUT_SIZE=84
+  IMAGE_EXISTS_LOCALLY=false
+  IMAGE_EXISTS_ON_DOCKER_HUB=false
+  LOCAL_DOCKER_IMAGES=$(docker images "$THIS_IMAGE")
+  if [ ! "${#LOCAL_DOCKER_IMAGES}" -eq $DOCKER_IMAGES_EMPTY_OUTPUT_SIZE ]; then
+    IMAGE_EXISTS_LOCALLY=true
+  fi
+  if [ "$IMAGE_EXISTS_LOCALLY" == true ]; then
+    if [ "$OVERWRITE_ECR" == false ]; then
+      exitIfEcrImageTagComboAlreadyExists
+    fi
+    if [ "$REPO_EXISTS_IN_ECR" == false ]; then
+      ECR_REPOSITORY_URI=$(sed -e 's/^"//' -e 's/"$//' <<< $(aws ecr create-repository --repository-name "$THIS_IMAGE_NAME" --region "$AWS_REGION" | jq '.repository.repositoryUri'))
+    else
+      ECR_REPOSITORY_URI=$(sed -e 's/^"//' -e 's/"$//' <<< $(aws ecr describe-repositories --repository "$THIS_IMAGE_NAME" --region "$AWS_REGION" | jq '.repositories[0].repositoryUri'))
+    fi
+    THIS_IMAGE_ECR="$ECR_REPOSITORY_URI":"$THIS_IMAGE_TAG"
+    docker tag "$THIS_IMAGE" "$THIS_IMAGE_ECR"
+    docker push "$THIS_IMAGE_ECR" >> /dev/null
+    CONTAINER_DEFINITIONS[$IMAGE_INDEX,image]="$THIS_IMAGE_ECR"
+  else
+    # TODO: Check if image exists on Docker Hub
+    echo WARNING: Image does not exist locally
+  fi
+}
+
+# Stall execution until the newly created EC2 instance is registered in the specified ECS cluster
+function waitUntilInstanceRegisteredInCluster() {
+  while : ; do
+    CLUSTER_INSTANCES=$(aws ecs list-container-instances --cluster "$CLUSTER_NAME" --region "$AWS_REGION" | jq '.containerInstanceArns')
+    CLUSTER_INSTANCE_COUNT=$(echo $CLUSTER_INSTANCES | jq '. | length')
+    for (( CLUSTER_INSTANCE_INDEX=0; CLUSTER_INSTANCE_INDEX<CLUSTER_INSTANCE_COUNT; CLUSTER_INSTANCE_INDEX++ )); do
+      CLUSTER_INSTANCE_ID=$(sed -e 's/^.*\///' -e 's/"$//' <<< $(echo "$CLUSTER_INSTANCES" | jq '.['"$CLUSTER_INSTANCE_INDEX"']'))
+      CLUSTER_EC2_INSTANCE_ID=$(sed -e 's/^"//' -e 's/"$//' <<< $(aws ecs describe-container-instances --cluster sample --container-instances "$CLUSTER_INSTANCE_ID" | jq '.containerInstances[0].ec2InstanceId'))
+      if [ "$CLUSTER_EC2_INSTANCE_ID" == "$NEW_INSTANCE_ID" ]; then
+        break 2
+      fi
+    done
+    sleep 2
+  done
+}
+
 declareConstants
 handleInput "$@"
-defineColorPalette
-createClusterIfItDoesNotExist
-calculateSumResourceRequirementsForTask
-findExistingSuitableInstanceInCluster
-#editSuitableInstanceOpenPorts
-getMinimumSuitableInstanceType
-createAndRegisterNewInstanceIfNeeded
-registerEcsTaskDefinitionIfNeeded
+determineLaunchType
+createClusterIfDoesNotExist
+if [ "$LAUNCH_TYPE" == "new-everything" ]; then
+  createAndRegisterNewInstance
+  registerTaskDefinition
+elif [ "$LAUNCH_TYPE" == "new-instance" ]; then
+  createAndRegisterNewInstance
+elif [ "$LAUNCH_TYPE" == "new-task-definition" ]; then
+  registerTaskDefinition
+elif [ "$LAUNCH_TYPE" == "existing-resources" ]; then
+  :
+else
+  echo "ERROR: A valid launch type could not be determined"
+  exit 2
+fi
 launchTask
+editSecurityRulesForContainerPorts

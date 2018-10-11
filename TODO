@@ -1,7 +1,11 @@
 
-1. Get port flags working in Docker's native language in the `--container` flag of `launchEcsTask.sh`
+1. Get multiple `--container` flags working
 
-2. Validate Docker Hub images exist using `docker search`
+2. Better error messages
 
-3. Create scripts to destroy resources
+3. Validate Docker Hub images exist using `docker search`
+
+4. Create scripts to destroy resources
+
+5. Clean output
 
