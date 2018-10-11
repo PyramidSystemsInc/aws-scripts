@@ -190,6 +190,8 @@ function declareConstants() {
   AWS_EC2_AMI="ami-40142d25"
   CPU_COEF=1024
   MEMORY_COEF=926
+  DEFAULT_CPU=1024 # 1 vCPU
+  DEFAULT_MEMORY=463 # 0.5 GB
   defineColorPalette
 }
 
@@ -464,6 +466,8 @@ function parseAllDockerRunCommands() {
 
 # Parse a single `docker run` command
 function parseDockerRunCommand() {
+  THIS_CPU=$DEFAULT_CPU
+  THIS_MEMORY=$DEFAULT_MEMORY
   THIS_PORT_MAPPINGS=()
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -560,7 +564,7 @@ function splitImageIntoParts() {
 function validateDockerImages() {
   $(aws ecr get-login --no-include-email --region us-east-2) >/dev/null 2>/dev/null
   IMAGE_INDEX=0
-  for CONTAINER_DEFINITIONS in ${!CONTAINER_DEFINITIONS@}; do
+  while [ $IMAGE_INDEX -lt $CONTAINER_COUNT ]; do
     validateDockerImage
     IMAGE_INDEX=$((IMAGE_INDEX + 1))
   done
@@ -632,8 +636,9 @@ function validateLocalDockerOrDockerHubImage() {
     docker push "$THIS_IMAGE_ECR" >> /dev/null
     CONTAINER_DEFINITIONS[$IMAGE_INDEX,image]="$THIS_IMAGE_ECR"
   else
-    # TODO: Check if image exists on Docker Hub
-    echo WARNING: Image does not exist locally
+    # TODO: Check if image exists on Docker Hub before exiting
+    echo ERROR: Image does not exist locally
+    exit 2
   fi
 }
 
