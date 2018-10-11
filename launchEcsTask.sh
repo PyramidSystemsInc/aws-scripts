@@ -1,5 +1,28 @@
 #! /bin/bash
 
+# After parsing a `docker run` command, add to the container definitions associative array
+function addParsedDockerRunToContainerDefinitions() {
+  if [ -n "$THIS_NAME" ]; then
+    CONTAINER_DEFINITIONS[$CONTAINER_DEFINITION_COUNT,name]="$THIS_NAME"
+  else
+    echo -e "${COLOR_RED}"
+    echo "ERROR: Container name cannot be blank in 'docker run' command"
+    echo -e "${COLOR_NONE}"
+    exit 2
+  fi
+  if [ -n "$THIS_IMAGE" ]; then
+    CONTAINER_DEFINITIONS[$CONTAINER_DEFINITION_COUNT,image]="$THIS_IMAGE"
+  else
+    echo -e "${COLOR_RED}"
+    echo "ERROR: Container image cannot be blank in 'docker run' command"
+    echo -e "${COLOR_NONE}"
+    exit 2
+  fi
+  CONTAINER_DEFINITIONS[$CONTAINER_DEFINITION_COUNT,cpu]="$THIS_CPU"
+  CONTAINER_DEFINITIONS[$CONTAINER_DEFINITION_COUNT,memory]="$THIS_MEMORY"
+  CONTAINER_DEFINITIONS[$CONTAINER_DEFINITION_COUNT,port-mappings]="${THIS_PORT_MAPPINGS[@]}"
+}
+
 # For an existing task defintion, query for the sum cpu, memory, and ports all its containers require to run
 function calculateSumResourceRequirementsForExistingTask() {
   CPU_REQUIREMENT=0
@@ -15,7 +38,9 @@ function calculateSumResourceRequirementsForExistingTask() {
   if [ $? -eq 0 ]; then
     TASK_DEFINITION_INFO=$(echo $TASK_DEFINITION_INFO | jq '.taskDefinition.containerDefinitions')
   else
-    echo "ERROR! The revision number specifed does not exist"
+    echo -e "${COLOR_RED}"
+    echo "ERROR: The revision number specifed does not exist"
+    echo -e "${COLOR_NONE}"
     exit 2
   fi
   TASK_DEFINITION_COUNT=$(echo "$TASK_DEFINITION_INFO" | jq '. | length')
@@ -50,6 +75,15 @@ function calculateSumResourceRequirementsForTask() {
   fi
 }
 
+# Query the status of the cluster name provided to set the CLUSTER_ACTIVE variable
+function checkIfClusterActive() {
+  CLUSTER_ACTIVE=false
+  CLUSTER_DESCRIPTION=$(aws ecs describe-clusters --clusters "$CLUSTER_NAME" --region "$AWS_REGION" | jq '.clusters')
+  if [ $(echo "$CLUSTER_DESCRIPTION" | jq '.[0].status') == \"ACTIVE\" ]; then
+    CLUSTER_ACTIVE=true
+  fi
+}
+
 # Check if a given EC2 instance's remaining cpu and memory resources will allow a task definition to run
 function checkIfInstanceSuitsTask() {
   if [ $THIS_INSTANCE_CPU_REMAINING -ge $CPU_REQUIREMENT ] && [ $THIS_INSTANCE_MEMORY_REMAINING -ge $MEMORY_REQUIREMENT ]; then
@@ -74,11 +108,7 @@ function createAndRegisterNewInstance() {
 
 # If the cluster specified does not exist, create it
 function createClusterIfDoesNotExist() {
-  CLUSTER_ACTIVE=false
-  CLUSTER_DESCRIPTION=$(aws ecs describe-clusters --clusters "$CLUSTER_NAME" --region "$AWS_REGION" | jq '.clusters')
-  if [ $(echo "$CLUSTER_DESCRIPTION" | jq '.[0].status') == \"ACTIVE\" ]; then
-    CLUSTER_ACTIVE=true
-  fi
+  checkIfClusterActive
   if [ "$CLUSTER_ACTIVE" == false ]; then
     ./createEcsCluster.sh --name "$CLUSTER_NAME" --region "$AWS_REGION"
   fi
@@ -190,32 +220,31 @@ function declareConstants() {
   AWS_EC2_AMI="ami-40142d25"
   CPU_COEF=1024
   MEMORY_COEF=926
-  DEFAULT_CPU=1024 # 1 vCPU
-  DEFAULT_MEMORY=463 # 0.5 GB
   defineColorPalette
 }
 
 # Declare defaults for optional input values / flags
 function declareInputDefaults() {
   AWS_REGION="us-east-2"
+  DEFAULT_CPU=1024 # 1 vCPU
+  DEFAULT_MEMORY=463 # 0.5 GB
   OVERWRITE_ECR=false
   REVISION="hasnotbeenset"
 }
 
 # Define all colors used for output
 function defineColorPalette() {
+  COLOR_BLUE='\033[0;34m'
   COLOR_RED='\033[0;91m'
+  COLOR_WHITE='\033[0;97m'
   COLOR_WHITE_BOLD='\033[1;97m'
   COLOR_NONE='\033[0m'
 }
 
 # Based on the user input and what resources are lying around in the cluster specified, check if we need to create a new EC2 instance
 function determineIfCreatingNewEc2Instance() {
-  CLUSTER_DESCRIPTION=$(aws ecs describe-clusters --clusters "$CLUSTER_NAME" --region "$AWS_REGION" | jq '.clusters')
-  if [ $(echo "$CLUSTER_DESCRIPTION" | jq '.[0].status') == \"ACTIVE\" ]; then
-    CLUSTER_ACTIVE=true
-  fi
-  if [ "$CLUSTER_ACTIVE" == false ]; then
+  checkIfClusterActive
+  if [ "$CLUSTER_ACTIVE" == true ]; then
     findExistingSuitableInstanceInCluster
     if [ "$INSTANCE_SUITS_TASK" == false ]; then
       CREATING_NEW_EC2_INSTANCE=true
@@ -237,7 +266,12 @@ function determineIfCreatingNewTaskDefinition() {
   elif [ "${#DOCKER_RUN_COMMANDS}" -ge 1 ] && [ "$REVISION" == "hasnotbeenset" ]; then
     CREATING_NEW_TASK_DEFINITION=true
   else
-    echo "ERROR: Only one of the following flags should be used: One or more '--container <DOCKER RUN COMMAND>' flags to register a new task definition -OR- a single '--revision <NUMBER>' flag in order to run an existing task definition. Omitting both tags assumes you want to use an existing task defintion and the latest revision of that task"
+    echo -e "${COLOR_RED}"
+    echo "ERROR: The combination of '--container' and '--revision' flags provided is invalid. Please retry your command modified to suit one of the following conditions:"
+    echo -e "${COLOR_WHITE}    * One or more '--container <DOCKER RUN COMMAND>' flags to register a new task definition"
+    echo "    * A single '--revision <NUMBER>' flag in order to run an existing task definition"
+    echo "    * Omitting both tags to use the latest revision of an existing task defintion"
+    echo -e "${COLOR_NONE}"
     exit 2
   fi
 }
@@ -248,6 +282,15 @@ function determineLaunchType() {
   calculateSumResourceRequirementsForTask
   determineIfCreatingNewEc2Instance
   setLaunchType
+}
+
+function exitDueToInvalidLaunchType() {
+  echo -e "${COLOR_RED}"
+  echo "ERROR: Something went wrong on our end. A valid launch type could not be determined. This means we could not decide if we need to create a new EC2 instance or a new ECS task definition"
+  echo -e "${COLOR_BLUE}"
+  echo "If running the same command again does not fix the problem, contact Jeff at jdiederiks@psi-it.com"
+  echo -e "${COLOR_NONE}"
+  exit 2
 }
 
 # Exit if the `--overwrite-ecr` flag was not used and the `docker push` to ECR required to run the task would overwrite ECR
@@ -266,7 +309,14 @@ function exitIfEcrImageTagComboAlreadyExists() {
         ECR_IMAGE_TAG=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo "$ECR_IMAGES" | jq '.['"$ECR_IMAGE_INDEX"'].imageTag'))
         if [ ! $ECR_IMAGE_TAG == null ]; then
           if [ "$ECR_IMAGE_TAG" == "$THIS_IMAGE_TAG" ]; then
-            echo "ERROR: The image ""$THIS_IMAGE"" already exists in ECR. The task creation was abandoned because creating it would require overwriting the image in ECR. If you wish to use the image in ECR, run the image ecr/""$THIS_IMAGE"". If you want to use your local image, either retag it using 'docker tag ""$THIS_IMAGE"" ""$THIS_IMAGE_NAME"":<new-tag-here>' or re-run your command with the '--overwrite-ecr' flag"
+            echo -e "${COLOR_RED}"
+            echo "ERROR: Task creation was abandoned because it would require overwriting the ""$THIS_IMAGE"""
+            echo "image in ECR. Please retry your command modified to suit one of the following conditions:"
+            echo -e "${COLOR_WHITE}    * If you wish to use the image in ECR, specify your image using the ECR shortcut as follows: 'ecr/""$THIS_IMAGE""'"
+            echo "    * If you want to use your local image, either:"
+            echo "        * Retag it using 'docker tag ""$THIS_IMAGE"" ""$THIS_IMAGE_NAME"":<new-tag-here>' -OR-"
+            echo "        * Retry your command with the '--overwrite-ecr' flag"
+            echo -e "${COLOR_NONE}"
             exit 2
           fi
         fi
@@ -310,7 +360,10 @@ function findNewInstanceInformation() {
     fi
   done
   if [ -z "$THIS_INSTANCE_IP" ]; then
-    echo -e "${COLOR_RED_BOLD}ERROR: The instance could not be found"
+    echo -e "${COLOR_RED}"
+    echo "ERROR: Something went wrong on our end. The (supposedly) newly created EC2 instance could not be found"
+    echo -e "${COLOR_BLUE}"
+    echo "If running the same command again does not fix the problem, contact Jeff at jdiederiks@psi-it.com"
     echo -e "${COLOR_NONE}"
     exit 2
   else
@@ -398,6 +451,11 @@ function launchTask() {
   fi
 }
 
+# Perform a `docker login` to ECR
+function loginToEcr() {
+  $(aws ecr get-login --no-include-email --region "$AWS_REGION") >/dev/null 2>/dev/null
+}
+
 # If the user provides input the script does not understand, show them which part is being ignored
 function notifyUserOfUnknownInputArgs() {
   if [ ${#ARGS} -gt 0 ]; then
@@ -460,12 +518,16 @@ function parseAllDockerRunCommands() {
   CONTAINER_DEFINITION_COUNT=0
   for DOCKER_RUN_COMMAND in "${DOCKER_RUN_COMMANDS[@]}"; do
     parseDockerRunCommand $DOCKER_RUN_COMMAND
+    addParsedDockerRunToContainerDefinitions
     CONTAINER_DEFINITION_COUNT=$(($CONTAINER_DEFINITION_COUNT + 1))
   done
 }
 
 # Parse a single `docker run` command
 function parseDockerRunCommand() {
+  THIS_ARGS=()
+  THIS_NAME=''
+  THIS_IMAGE=()
   THIS_CPU=$DEFAULT_CPU
   THIS_MEMORY=$DEFAULT_MEMORY
   THIS_PORT_MAPPINGS=()
@@ -481,19 +543,14 @@ function parseDockerRunCommand() {
       docker) shift 1;;
       run) shift 1;;
       -*) echo "unknown option: $1" >&2; exit 1;;
-      *) ARGS+=("$1"); shift 1;;
+      *) THIS_ARGS+=("$1"); shift 1;;
     esac
   done
-  for ARG in "${ARGS[@]}"; do
-    if [ -n "$ARG" ]; then
-      THIS_IMAGE=("$ARG")
+  for THIS_ARG in "${THIS_ARGS[@]}"; do
+    if [ -n "$THIS_ARG" ]; then
+      THIS_IMAGE=("$THIS_ARG")
     fi
   done
-  CONTAINER_DEFINITIONS[$CONTAINER_DEFINITION_COUNT,name]="$THIS_NAME"
-  CONTAINER_DEFINITIONS[$CONTAINER_DEFINITION_COUNT,image]="$THIS_IMAGE"
-  CONTAINER_DEFINITIONS[$CONTAINER_DEFINITION_COUNT,cpu]="$THIS_CPU"
-  CONTAINER_DEFINITIONS[$CONTAINER_DEFINITION_COUNT,memory]="$THIS_MEMORY"
-  CONTAINER_DEFINITIONS[$CONTAINER_DEFINITION_COUNT,port-mappings]="${THIS_PORT_MAPPINGS[@]}"
 }
 
 # Divide the user input into variables
@@ -539,8 +596,7 @@ function setLaunchType() {
   elif [ "$CREATING_NEW_TASK_DEFINITION" == false ] && [ "$CREATING_NEW_EC2_INSTANCE" == false ]; then
     LAUNCH_TYPE="existing-resources"
   else
-    echo "ERROR: A valid launch type could not be determined"
-    exit 2
+    exitDueToInvalidLaunchType
   fi
 }
 
@@ -562,7 +618,7 @@ function splitImageIntoParts() {
 
 # Validate all Docker images specified in a task defintion or `docker run` command exist
 function validateDockerImages() {
-  $(aws ecr get-login --no-include-email --region us-east-2) >/dev/null 2>/dev/null
+  loginToEcr
   IMAGE_INDEX=0
   while [ $IMAGE_INDEX -lt $CONTAINER_COUNT ]; do
     validateDockerImage
@@ -608,7 +664,13 @@ function validateEcrDockerImage() {
     fi
   done
   if [ "$IMAGE_EXISTS_IN_ECR" == false ]; then
-    echo "ERROR: The image ""$THIS_IMAGE"" could not be found in ECR. Are you using the correct AWS account and region? Are you using the correct tag?"
+    echo -e "${COLOR_RED}"
+    echo "ERROR: The image ""$THIS_IMAGE"" could not be found in ECR. Here are a few possible remedies:"
+    echo -e "${COLOR_WHITE}    * This script defaults to the AWS region 'us-east-2'. Is that the region intended? If not, was a region specified?"
+    echo "    * Are the AWS credentials located at '~/.aws/credentials' the correct set of credentials?"
+    echo "    * Does the image tag exist in ECR of the specified AWS region?"
+    echo "    * Was a local image intended, but the ECR shortcut (i.e. ecr/imagename) used instead?"
+    echo -e "${COLOR_NONE}"
     exit 2
   fi
 }
@@ -637,7 +699,11 @@ function validateLocalDockerOrDockerHubImage() {
     CONTAINER_DEFINITIONS[$IMAGE_INDEX,image]="$THIS_IMAGE_ECR"
   else
     # TODO: Check if image exists on Docker Hub before exiting
-    echo ERROR: Image does not exist locally
+    echo -e "${COLOR_RED}"
+    echo "ERROR: The specified Docker image does not exist locally"
+    echo -e "${COLOR_WHITE}"
+    echo "NOTICE: In the near future, Docker images from Docker Hub will be supported as well"
+    echo -e "${COLOR_NONE}"
     exit 2
   fi
 }
@@ -672,8 +738,7 @@ elif [ "$LAUNCH_TYPE" == "new-task-definition" ]; then
 elif [ "$LAUNCH_TYPE" == "existing-resources" ]; then
   :
 else
-  echo "ERROR: A valid launch type could not be determined"
-  exit 2
+  exitDueToInvalidLaunchType
 fi
 launchTask
 editSecurityRulesForContainerPorts
