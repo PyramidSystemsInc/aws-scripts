@@ -240,6 +240,7 @@ function declareInputDefaults() {
 # Define all colors used for output
 function defineColorPalette() {
   COLOR_BLUE='\033[0;34m'
+	COLOR_GREEN='\033[0;32m'
   COLOR_RED='\033[0;91m'
   COLOR_WHITE='\033[0;97m'
   COLOR_WHITE_BOLD='\033[1;97m'
@@ -462,6 +463,7 @@ function getNewUniqueInstanceName() {
 function handleInput() {
   declareInputDefaults
   parseInputFlags "$@"
+  showHelp
   notifyUserOfUnknownInputArgs
   parseAllDockerRunCommands
 }
@@ -585,14 +587,19 @@ function parseInputFlags() {
     case "$1" in
       # Required inputs
       --cluster) CLUSTER_NAME="$2"; shift 2;;
+      -t) TASK_NAME="$2"; shift 2;;
       --task) TASK_NAME="$2"; shift 2;;
       # Only one of the following inputs can be used (neither defaults to `--revision=latest`)
+      -c) CONTAINER_COUNT=$(($CONTAINER_COUNT + 1)); DOCKER_RUN_COMMANDS+=("$2"); shift 2;;
       --container) CONTAINER_COUNT=$(($CONTAINER_COUNT + 1)); DOCKER_RUN_COMMANDS+=("$2"); shift 2;;
       --revision) REVISION=("$2"); shift 2;;
       # Optional inputs
+      -o) OVERWRITE_ECR=true; shift 1;;
       --overwrite-ecr) OVERWRITE_ECR=true; shift 1;;
+      -r) AWS_REGION="$2"; shift 2;;
       --region) AWS_REGION="$2"; shift 2;;
       # Optional inputs yet to be implemented
+      -s) NO_OUTPUT=true; shift 1;;
       --skip-output) NO_OUTPUT=true; shift 1;;
       -h) HELP_WANTED=true; shift 1;;
       --help) HELP_WANTED=true; shift 1;;
@@ -629,6 +636,50 @@ function setLaunchType() {
     LAUNCH_TYPE="existing-resources"
   else
     exitDueToInvalidLaunchType
+  fi
+}
+
+function showHelp() {
+	if [ "$HELP_WANTED" == "true" ]; then
+    echo -e ""
+    echo -e "Usage: ./launchEcsTask.sh --cluster <CLUSTER_NAME> --task <TASK_NAME> [OPTIONS]"
+    echo -e ""
+    echo -e "Run a task on AWS ECS using the familiar syntax of Docker run commands"
+    echo -e ""
+    echo -e "Options:"
+    echo -e "      --cluster <string>                   Name of the ECS cluster you want to run your task on. If it does not exist, it will be created ${COLOR_GREEN}(required)${COLOR_NONE}"
+    echo -e "  -c, --container \"<docker_run_command>\"   Run command for a new container in ECS. Multiple container flags can be provided. Cannot be used along with the"
+    echo -e "                                             revision flag. A shortcut exists for referencing images from ECR. By prepending 'ecr/' to your image name, the"
+    echo -e "                                             'ecr' will expand at runtime to the full ECR URI. For more information on usage, run 'docker run --help'"
+    echo -e "  -h, --help                               Shows this block of text. Specifying the help flag will abort creation of AWS resources"
+    echo -e "  -o, --overwrite-ecr                      By default, this script will not allow you to overwrite ECR Docker images. If you are running a local image, it"
+    echo -e "                                             must be pushed to ECR before it can be run. Therefore, if you want to use a local image and that image exists in"
+    echo -e "                                             ECR, you must add this flag to show you intended to overwrite the ECR image"
+    echo -e "  -r, --region <string>                    AWS region where you want your ECS task to run. Defaults to 'us-east-2'"
+    echo -e "      --revision <number>                  Version number of an existing ECS task. By omitting the revision flag, it is assumed you want to run the latest"
+    echo -e "                                             version of the task. Cannot be used along with the container flag"
+    echo -e "  -s, --skip-output                        Suppress all output including errors"
+    echo -e "  -t, --task <string>                      Name of the task you want to run. If it does not exist, it will be created ${COLOR_GREEN}(required)${COLOR_NONE}"
+    echo -e ""
+    echo -e "Examples:"
+    echo -e "$ ./launchEcsTask.sh --cluster sample --task important-thing --skip-output"
+    echo -e "    * Running the latest revision of an existing task"
+    echo -e "    * Command will give zero output"
+    echo -e ""
+    echo -e "$ ./launchEcsTask.sh --cluster cluster --task task --revision 7 --region us-east-1"
+    echo -e "    * Running a specific revision of an existing task in the Northern Virigina AWS region"
+    echo -e ""
+    echo -e "$ ./launchEcsTask.sh --cluster project-name --task selenium --container \"docker run -p 4444:4444 --name selenium-hub selenium/hub:3.14.0-gallium\""
+    echo -e "    * Running a new task with one container"
+    echo -e ""
+    echo -e "$ ./launchEcsTask.sh --cluster dev --task whole-application -c \"docker run --name front -p 443:443 ecr/web\" -c \"docker run --name middle -p 8081:8081 ecr/services\" -c \"docker run --name db -p 5432:5432 mongo:dev\" --overwrite-ecr"
+    echo -e "    * Running a new task with three containers"
+    echo -e "    * If 'mongo:dev' exists in ECR, it will be overwritten"
+    echo -e ""
+    echo -e "Having trouble?"
+    echo -e "  Please send any questions or issues to jdiederiks@psi-it.com"
+    echo -e ""
+    exit 2
   fi
 }
 
