@@ -98,7 +98,7 @@ function createAndRegisterNewInstance() {
     getMinimumSuitableInstanceType
     getNewUniqueInstanceName
     createNewInstanceOpenPortSpec
-    COMMAND="./createEc2Instance.sh --name "$NEW_INSTANCE_NAME" --image "$AWS_EC2_AMI" --type "$MINIMUM_SUITABLE_INSTANCE_TYPE" --iam-role jenkins_instance --port 22 "$NEW_INSTANCE_OPEN_PORTS_SPEC" --startup-script installEcsAgentOnEc2Instance.sh"
+    COMMAND="./createEc2Instance.sh --name "$NEW_INSTANCE_NAME" --image "$AWS_EC2_AMI" --type "$MINIMUM_SUITABLE_INSTANCE_TYPE" --iam-role jenkins_instance --port 22 "$NEW_INSTANCE_OPEN_PORTS_SPEC" --startup-script util/installEcsAgentOnEc2Instance.sh"
     $($COMMAND >> /dev/null)
     exitIfScriptFailed
     findNewInstanceInformation
@@ -110,7 +110,7 @@ function createAndRegisterNewInstance() {
 function createClusterIfDoesNotExist() {
   checkIfClusterActive
   if [ "$CLUSTER_ACTIVE" == false ]; then
-    ./createEcsCluster.sh --name "$CLUSTER_NAME" --region "$AWS_REGION"
+    ./util/createEcsCluster.sh --name "$CLUSTER_NAME" --region "$AWS_REGION"
   fi
 }
 
@@ -413,7 +413,7 @@ function getEcrRepositoryUri() {
 # Based on the cpu and memory requirements of the task, find the smallest
 # instance type in the T3 family of EC2 instances which is compatible
 function getMinimumSuitableInstanceType() {
-  . ./awsT3InstanceSpecs.sh
+  . ./util/awsT3InstanceSpecs.sh
   MINIMUM_SUITABLE_INSTANCE_TYPE=false
   if [ "$INSTANCE_SUITS_TASK" == false ]; then
     for AWS_T3_INSTANCE_SPEC in ${!AWS_T3_INSTANCE_SPEC@}; do

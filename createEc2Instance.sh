@@ -161,7 +161,7 @@ function waitUntilInstanceRunning() {
 handleInput "$@"
 defineColorPalette
 #defineExpectedProgress
-#trap 'kill $MONITOR_PROGRESS_PID; exit' SIGINT; ./monitorProgress.sh "$EXPECTED_PROGRESS" & MONITOR_PROGRESS_PID=$!
+#trap 'kill $MONITOR_PROGRESS_PID; exit' SIGINT; ./util/monitorProgress.sh "$EXPECTED_PROGRESS" & MONITOR_PROGRESS_PID=$!
 createSecurityGroup
 createKeyPair
 createInstance

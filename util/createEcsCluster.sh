@@ -49,7 +49,7 @@ function handleInput() {
 handleInput "$@"
 defineColorPalette
 defineExpectedProgress
-trap 'kill $MONITOR_PROGRESS_PID; exit' SIGINT; ./monitorProgress.sh "$EXPECTED_PROGRESS" & MONITOR_PROGRESS_PID=$!
+trap 'kill $MONITOR_PROGRESS_PID; exit' SIGINT; ./util/monitorProgress.sh "$EXPECTED_PROGRESS" & MONITOR_PROGRESS_PID=$!
 createCluster
 sleep 3; if pgrep $MONITOR_PROGRESS_PID; then pkill $MONITOR_PROGRESS_PID; fi
 echo -e ""
