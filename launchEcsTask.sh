@@ -114,6 +114,11 @@ function createClusterIfDoesNotExist() {
   fi
 }
 
+# Create a repository on ECR to house a local image
+function createEcrRepository() {
+  ECR_REPOSITORY_URI=$(sed -e 's/^"//' -e 's/"$//' <<< $(aws ecr create-repository --repository-name "$THIS_IMAGE_NAME" --region "$AWS_REGION" | jq '.repository.repositoryUri'))
+}
+
 # Create a string recognized by the `createEc2Instance.sh` script which will open the ports necessary to run the task
 function createNewInstanceOpenPortSpec() {
   NEW_INSTANCE_OPEN_PORTS_SPEC=""
@@ -276,6 +281,16 @@ function determineIfCreatingNewTaskDefinition() {
   fi
 }
 
+# Check if a Docker image exists locally
+function determineIfDockerImageExistsLocally() {
+  IMAGE_EXISTS_LOCALLY=false
+  DOCKER_IMAGES_EMPTY_OUTPUT_SIZE=84
+  LOCAL_DOCKER_IMAGES=$(docker images "$THIS_IMAGE")
+  if [ ! "${#LOCAL_DOCKER_IMAGES}" -eq $DOCKER_IMAGES_EMPTY_OUTPUT_SIZE ]; then
+    IMAGE_EXISTS_LOCALLY=true
+  fi
+}
+
 # Determine whether the ECS task being launched requires a new task definition to be registered and/or a new EC2 instance to run on
 function determineLaunchType() {
   determineIfCreatingNewTaskDefinition
@@ -284,6 +299,41 @@ function determineLaunchType() {
   setLaunchType
 }
 
+# Exit if the `--overwrite-ecr` flag was not used and the `docker push` to ECR required to run the task would overwrite ECR
+function ensureNoEcrConflict() {
+  if [ "$OVERWRITE_ECR" == false ]; then
+    REPO_EXISTS_IN_ECR=false
+    ECR_REPOS=$(aws ecr describe-repositories --region "$AWS_REGION" | jq '.repositories')
+    ECR_REPO_COUNT=$(echo "$ECR_REPOS" | jq '. | length')
+    for (( ECR_REPO_INDEX=0; ECR_REPO_INDEX<ECR_REPO_COUNT; ECR_REPO_INDEX++ )); do
+      THIS_ECR_REPO=$(echo "$ECR_REPOS" | jq '.['"$ECR_REPO_INDEX"']')
+      THIS_ECR_REPO_NAME=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo "$THIS_ECR_REPO" | jq '.repositoryName'))
+      if [ "$THIS_ECR_REPO_NAME" == "$THIS_IMAGE_NAME" ]; then
+        REPO_EXISTS_IN_ECR=true
+        ECR_IMAGES=$(aws ecr list-images --repository-name "$THIS_ECR_REPO_NAME" --region "$AWS_REGION" | jq '.imageIds')
+        ECR_IMAGE_COUNT=$(echo "$ECR_IMAGES" | jq '. | length')
+        for (( ECR_IMAGE_INDEX=0; ECR_IMAGE_INDEX<ECR_IMAGE_COUNT; ECR_IMAGE_INDEX++ )); do
+          ECR_IMAGE_TAG=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo "$ECR_IMAGES" | jq '.['"$ECR_IMAGE_INDEX"'].imageTag'))
+          if [ ! $ECR_IMAGE_TAG == null ]; then
+            if [ "$ECR_IMAGE_TAG" == "$THIS_IMAGE_TAG" ]; then
+              echo -e "${COLOR_RED}"
+              echo "ERROR: Task creation was abandoned because it would require overwriting the ""$THIS_IMAGE"""
+              echo "image in ECR. Please retry your command modified to suit one of the following conditions:"
+              echo -e "${COLOR_WHITE}    * If you wish to use the image in ECR, specify your image using the ECR shortcut as follows: 'ecr/""$THIS_IMAGE""'"
+              echo "    * If you want to use your local image, either:"
+              echo "        * Retag it using 'docker tag ""$THIS_IMAGE"" ""$THIS_IMAGE_NAME"":<new-tag-here>' -OR-"
+              echo "        * Retry your command with the '--overwrite-ecr' flag"
+              echo -e "${COLOR_NONE}"
+              exit 2
+            fi
+          fi
+        done
+      fi
+    done
+  fi
+}
+
+# Print an error and exit due to an invalid launch type
 function exitDueToInvalidLaunchType() {
   echo -e "${COLOR_RED}"
   echo "ERROR: Something went wrong on our end. A valid launch type could not be determined. This means we could not decide if we need to create a new EC2 instance or a new ECS task definition"
@@ -291,38 +341,6 @@ function exitDueToInvalidLaunchType() {
   echo "If running the same command again does not fix the problem, contact Jeff at jdiederiks@psi-it.com"
   echo -e "${COLOR_NONE}"
   exit 2
-}
-
-# Exit if the `--overwrite-ecr` flag was not used and the `docker push` to ECR required to run the task would overwrite ECR
-function exitIfEcrImageTagComboAlreadyExists() {
-  REPO_EXISTS_IN_ECR=false
-  ECR_REPOS=$(aws ecr describe-repositories --region "$AWS_REGION" | jq '.repositories')
-  ECR_REPO_COUNT=$(echo "$ECR_REPOS" | jq '. | length')
-  for (( ECR_REPO_INDEX=0; ECR_REPO_INDEX<ECR_REPO_COUNT; ECR_REPO_INDEX++ )); do
-    THIS_ECR_REPO=$(echo "$ECR_REPOS" | jq '.['"$ECR_REPO_INDEX"']')
-    THIS_ECR_REPO_NAME=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo "$THIS_ECR_REPO" | jq '.repositoryName'))
-    if [ "$THIS_ECR_REPO_NAME" == "$THIS_IMAGE_NAME" ]; then
-      REPO_EXISTS_IN_ECR=true
-      ECR_IMAGES=$(aws ecr list-images --repository-name "$THIS_ECR_REPO_NAME" --region "$AWS_REGION" | jq '.imageIds')
-      ECR_IMAGE_COUNT=$(echo "$ECR_IMAGES" | jq '. | length')
-      for (( ECR_IMAGE_INDEX=0; ECR_IMAGE_INDEX<ECR_IMAGE_COUNT; ECR_IMAGE_INDEX++ )); do
-        ECR_IMAGE_TAG=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo "$ECR_IMAGES" | jq '.['"$ECR_IMAGE_INDEX"'].imageTag'))
-        if [ ! $ECR_IMAGE_TAG == null ]; then
-          if [ "$ECR_IMAGE_TAG" == "$THIS_IMAGE_TAG" ]; then
-            echo -e "${COLOR_RED}"
-            echo "ERROR: Task creation was abandoned because it would require overwriting the ""$THIS_IMAGE"""
-            echo "image in ECR. Please retry your command modified to suit one of the following conditions:"
-            echo -e "${COLOR_WHITE}    * If you wish to use the image in ECR, specify your image using the ECR shortcut as follows: 'ecr/""$THIS_IMAGE""'"
-            echo "    * If you want to use your local image, either:"
-            echo "        * Retag it using 'docker tag ""$THIS_IMAGE"" ""$THIS_IMAGE_NAME"":<new-tag-here>' -OR-"
-            echo "        * Retry your command with the '--overwrite-ecr' flag"
-            echo -e "${COLOR_NONE}"
-            exit 2
-          fi
-        fi
-      done
-    fi
-  done
 }
 
 # Exit this script if the last command ran failed
@@ -387,6 +405,11 @@ function findRemainingResourcesOnInstance() {
   done
 }
 
+# Get the URI of an ECR repository to substitute the ECR shortcut (i.e. ecr/imagename) for the full URI
+function getEcrRepositoryUri() {
+  ECR_REPOSITORY_URI=$(sed -e 's/^"//' -e 's/"$//' <<< $(aws ecr describe-repositories --repository "$THIS_IMAGE_NAME" --region "$AWS_REGION" | jq '.repositories[0].repositoryUri'))
+}
+
 # Based on the cpu and memory requirements of the task, find the smallest
 # instance type in the T3 family of EC2 instances which is compatible
 function getMinimumSuitableInstanceType() {
@@ -443,6 +466,7 @@ function handleInput() {
   parseAllDockerRunCommands
 }
 
+# Run an ECS task
 function launchTask() {
   if [ "$REVISION" == "hasnotbeenset" ] || [ "$REVISION" == "latest" ] ; then
     ECS_LAUNCH_STATUS=$(aws ecs run-task --cluster "$CLUSTER_NAME" --task-definition "$TASK_NAME" --region "$AWS_REGION")
@@ -578,6 +602,14 @@ function parseInputFlags() {
   done
 }
 
+# Push a local Docker image to ECR then reference the new ECR URI in the container definitions
+function pushToEcr() {
+  THIS_IMAGE_ECR="$ECR_REPOSITORY_URI":"$THIS_IMAGE_TAG"
+  docker tag "$THIS_IMAGE" "$THIS_IMAGE_ECR"
+  docker push "$THIS_IMAGE_ECR" >> /dev/null
+  CONTAINER_DEFINITIONS[$IMAGE_INDEX,image]="$THIS_IMAGE_ECR"
+}
+
 # Register a new task definition with ECS
 function registerTaskDefinition() {
   validateDockerImages
@@ -675,36 +707,31 @@ function validateEcrDockerImage() {
   fi
 }
 
-# Validate a Docker image exists either locally or on Docker Hub
-function validateLocalDockerOrDockerHubImage() {
-  DOCKER_IMAGES_EMPTY_OUTPUT_SIZE=84
-  IMAGE_EXISTS_LOCALLY=false
-  IMAGE_EXISTS_ON_DOCKER_HUB=false
-  LOCAL_DOCKER_IMAGES=$(docker images "$THIS_IMAGE")
-  if [ ! "${#LOCAL_DOCKER_IMAGES}" -eq $DOCKER_IMAGES_EMPTY_OUTPUT_SIZE ]; then
-    IMAGE_EXISTS_LOCALLY=true
-  fi
-  if [ "$IMAGE_EXISTS_LOCALLY" == true ]; then
-    if [ "$OVERWRITE_ECR" == false ]; then
-      exitIfEcrImageTagComboAlreadyExists
-    fi
-    if [ "$REPO_EXISTS_IN_ECR" == false ]; then
-      ECR_REPOSITORY_URI=$(sed -e 's/^"//' -e 's/"$//' <<< $(aws ecr create-repository --repository-name "$THIS_IMAGE_NAME" --region "$AWS_REGION" | jq '.repository.repositoryUri'))
-    else
-      ECR_REPOSITORY_URI=$(sed -e 's/^"//' -e 's/"$//' <<< $(aws ecr describe-repositories --repository "$THIS_IMAGE_NAME" --region "$AWS_REGION" | jq '.repositories[0].repositoryUri'))
-    fi
-    THIS_IMAGE_ECR="$ECR_REPOSITORY_URI":"$THIS_IMAGE_TAG"
-    docker tag "$THIS_IMAGE" "$THIS_IMAGE_ECR"
-    docker push "$THIS_IMAGE_ECR" >> /dev/null
-    CONTAINER_DEFINITIONS[$IMAGE_INDEX,image]="$THIS_IMAGE_ECR"
-  else
-    # TODO: Check if image exists on Docker Hub before exiting
+# Validate that an image specified by the user exists on Docker Hub
+function validateDockerHubImageExists() {
+  SEARCH_RESULT_IMAGE_NAME_INDEX=5
+  DOCKER_SEARCH_RESULTS=($(docker search "$THIS_IMAGE_NAME" --limit 1))
+  if [ ! "${DOCKER_SEARCH_RESULTS[$SEARCH_RESULT_IMAGE_NAME_INDEX]}" == "$THIS_IMAGE_NAME" ]; then
     echo -e "${COLOR_RED}"
-    echo "ERROR: The specified Docker image does not exist locally"
-    echo -e "${COLOR_WHITE}"
-    echo "NOTICE: In the near future, Docker images from Docker Hub will be supported as well"
+    echo "ERROR: The specified Docker image does not exist locally or on Docker Hub. Does the image need to be built first?"
     echo -e "${COLOR_NONE}"
     exit 2
+  fi
+}
+
+# Validate a Docker image exists either locally or on Docker Hub
+function validateLocalDockerOrDockerHubImage() {
+  determineIfDockerImageExistsLocally
+  if [ "$IMAGE_EXISTS_LOCALLY" == true ]; then
+    ensureNoEcrConflict
+    if [ "$REPO_EXISTS_IN_ECR" == false ]; then
+      createEcrRepository
+    else
+      getEcrRepositoryUri
+    fi
+    pushToEcr
+  else
+    validateDockerHubImageExists
   fi
 }
 
