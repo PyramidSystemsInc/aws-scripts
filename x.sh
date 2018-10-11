@@ -75,7 +75,7 @@ function createAndRegisterNewInstance() {
 # If the cluster specified does not exist, create it
 function createClusterIfDoesNotExist() {
   CLUSTER_EXISTS=$(aws ecs describe-clusters --clusters "$CLUSTER_NAME" --region "$AWS_REGION" | jq '.clusters | length')
-  if [ "$CLUSTER_EXISTS" -ge 0 ]; then
+  if [ "$CLUSTER_EXISTS" -eq 0 ]; then
     ./createEcsCluster.sh --name "$CLUSTER_NAME" --region "$AWS_REGION"
   fi
 }
@@ -290,9 +290,9 @@ function handleInput() {
 
 function launchTask() {
   if [ "$REVISION" == "hasnotbeenset" ] || [ "$REVISION" == "latest" ] ; then
-    aws ecs run-task --cluster "$CLUSTER_NAME" --task-definition "$TASK_NAME" --region "$AWS_REGION"
+    ECS_LAUNCH_STATUS=$(aws ecs run-task --cluster "$CLUSTER_NAME" --task-definition "$TASK_NAME" --region "$AWS_REGION")
   else
-    aws ecs run-task --cluster "$CLUSTER_NAME" --task-definition "$TASK_NAME":"$REVISION" --region "$AWS_REGION"
+    ECS_LAUNCH_STATUS=$(aws ecs run-task --cluster "$CLUSTER_NAME" --task-definition "$TASK_NAME":"$REVISION" --region "$AWS_REGION")
   fi
 }
 
@@ -302,6 +302,24 @@ function notifyUserOfUnknownInputArgs() {
     echo -e "${COLOR_WHITE_BOLD}NOTICE: The following arguments were ignored: ${ARGS}"
     echo -e "${COLOR_NONE}"
   fi
+}
+
+# Change the ingress port security rules for an existing container instance to match the task running on it
+function editSecurityRulesForContainerPorts() {
+  CONTAINER_INSTANCE_ARN_OF_TASK=$(echo "$ECS_LAUNCH_STATUS" | jq '.tasks[0].containerInstanceArn')
+  CONTAINER_INSTANCE_ID_OF_TASK=$(sed -e 's/^.*\///' -e 's/"$//' <<< $(echo "$CONTAINER_INSTANCE_ARN_OF_TASK"))
+  EC2_ID_OF_TASK=$(sed -e 's/^"//' -e 's/"$//' <<< $(aws ecs describe-container-instances --cluster "$CLUSTER_NAME" --container-instances "$CONTAINER_INSTANCE_ID_OF_TASK" --region "$AWS_REGION" | jq '.containerInstances[0].ec2InstanceId'))
+  CONTAINER_INSTANCE_TASK_COUNT=$(aws ecs describe-container-instances --cluster "$CLUSTER_NAME" --container-instances "$CONTAINER_INSTANCE_ID_OF_TASK" --region "$AWS_REGION" | jq '.containerInstances[0].runningTasksCount')
+  SECURITY_GROUP_OF_TASK=$(sed -e 's/^"//' -e 's/"$//' <<< $(aws ec2 describe-instances --instance-ids "$EC2_ID_OF_TASK" | jq '.Reservations[0].Instances[0].NetworkInterfaces[0].Groups[0].GroupId'))
+  # TODO: Revoke all ingress port rules
+  #if [ $CONTAINER_INSTANCE_TASK_COUNT -eq 0 ]; then
+    #TODO: Loop through all ports on security group and run the following command: aws ec2 revoke-security-group-ingress --group-id "$SECURITY_GROUP_OF_TASK" --protocol tcp --port 8080 --cidr 0.0.0.0/0 --region "$AWS_REGION"
+    #aws ec2 revoke-security-group-ingress --group-id "$SECURITY_GROUP_OF_TASK" --ip-permissions '[{"IpProtocol": "tcp", "FromPort": 8080, "ToPort": 8081, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}]' --region "$AWS_REGION"
+  #fi
+  #aws ec2 describe-security-groups --group-ids sg-07c57d66ae177ddaf --region us-east-2
+  #for PORT in "${EXISTING_TASK_HOST_PORTS[@]}"; do
+    #aws ec2 authorize-security-group-ingress --group-id "$SECURITY_GROUP_OF_TASK" --protocol tcp --port "$PORT" --cidr 0.0.0.0/0 --region "$AWS_REGION" 2>/dev/null
+  #done
 }
 
 # Parse all the `docker run` commands provided, if any
@@ -518,8 +536,10 @@ elif [ "$LAUNCH_TYPE" == "new-instance" ]; then
 elif [ "$LAUNCH_TYPE" == "new-task-definition" ]; then
   registerTaskDefinition
   launchTask
+  editSecurityRulesForContainerPorts
 elif [ "$LAUNCH_TYPE" == "existing-resources" ]; then
   launchTask
+  editSecurityRulesForContainerPorts
 else
   echo "ERROR: A valid launch type could not be determined"
   exit 2
