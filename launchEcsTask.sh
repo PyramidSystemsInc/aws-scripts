@@ -74,8 +74,12 @@ function createAndRegisterNewInstance() {
 
 # If the cluster specified does not exist, create it
 function createClusterIfDoesNotExist() {
-  CLUSTER_EXISTS=$(aws ecs describe-clusters --clusters "$CLUSTER_NAME" --region "$AWS_REGION" | jq '.clusters | length')
-  if [ "$CLUSTER_EXISTS" -eq 0 ]; then
+  CLUSTER_ACTIVE=false
+  CLUSTER_DESCRIPTION=$(aws ecs describe-clusters --clusters "$CLUSTER_NAME" --region "$AWS_REGION" | jq '.clusters')
+  if [ $(echo "$CLUSTER_DESCRIPTION" | jq '.[0].status') == \"ACTIVE\" ]; then
+    CLUSTER_ACTIVE=true
+  fi
+  if [ "$CLUSTER_ACTIVE" == false ]; then
     ./createEcsCluster.sh --name "$CLUSTER_NAME" --region "$AWS_REGION"
   fi
 }
@@ -97,7 +101,7 @@ function createTaskDefinitionJson() {
 	EOF
   )
   CONTAINER_INDEX=0
-  for CONTAINER_DEFINITIONS in ${!CONTAINER_DEFINITIONS@}; do
+  while [ $CONTAINER_INDEX -lt $CONTAINER_COUNT ]; do
     if [ $CONTAINER_INDEX -eq 0 ]; then
 			TASK_DEFINITION="$TASK_DEFINITION"$(cat <<-EOF
 
@@ -116,16 +120,16 @@ function createTaskDefinitionJson() {
     fi
 		TASK_DEFINITION="$TASK_DEFINITION"$(cat <<-EOF
 
-			      "name": "${CONTAINER_DEFINITIONS[0,name]}",
-			      "image": "${CONTAINER_DEFINITIONS[0,image]}",
-			      "cpu": ${CONTAINER_DEFINITIONS[0,cpu]},
-			      "memory": ${CONTAINER_DEFINITIONS[0,memory]},
+			      "name": "${CONTAINER_DEFINITIONS[$CONTAINER_INDEX,name]}",
+			      "image": "${CONTAINER_DEFINITIONS[$CONTAINER_INDEX,image]}",
+			      "cpu": ${CONTAINER_DEFINITIONS[$CONTAINER_INDEX,cpu]},
+			      "memory": ${CONTAINER_DEFINITIONS[$CONTAINER_INDEX,memory]},
 			      "essential": true,
 			      "portMappings": [
 
 		EOF
 		)
-    PORT_MAPPINGS=(${CONTAINER_DEFINITIONS[0,port-mappings]})
+    PORT_MAPPINGS=(${CONTAINER_DEFINITIONS[$CONTAINER_INDEX,port-mappings]})
     PORT_MAPPINGS_INDEX=0
     for PORT_MAPPING in "${PORT_MAPPINGS[@]}"; do
       if [ $PORT_MAPPINGS_INDEX -eq 0 ]; then
@@ -205,8 +209,11 @@ function defineColorPalette() {
 
 # Based on the user input and what resources are lying around in the cluster specified, check if we need to create a new EC2 instance
 function determineIfCreatingNewEc2Instance() {
-  CLUSTER_EXISTS=$(aws ecs describe-clusters --clusters "$CLUSTER_NAME" --region "$AWS_REGION" | jq '.clusters | length')
-  if [ $CLUSTER_EXISTS -gt 0 ]; then 
+  CLUSTER_DESCRIPTION=$(aws ecs describe-clusters --clusters "$CLUSTER_NAME" --region "$AWS_REGION" | jq '.clusters')
+  if [ $(echo "$CLUSTER_DESCRIPTION" | jq '.[0].status') == \"ACTIVE\" ]; then
+    CLUSTER_ACTIVE=true
+  fi
+  if [ "$CLUSTER_ACTIVE" == false ]; then
     findExistingSuitableInstanceInCluster
     if [ "$INSTANCE_SUITS_TASK" == false ]; then
       CREATING_NEW_EC2_INSTANCE=true
@@ -487,6 +494,7 @@ function parseDockerRunCommand() {
 
 # Divide the user input into variables
 function parseInputFlags() {
+  CONTAINER_COUNT=0
   DOCKER_RUN_COMMANDS=()
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -494,7 +502,7 @@ function parseInputFlags() {
       --cluster) CLUSTER_NAME="$2"; shift 2;;
       --task) TASK_NAME="$2"; shift 2;;
       # Only one of the following inputs can be used (neither defaults to `--revision=latest`)
-      --container) DOCKER_RUN_COMMANDS+=("$2"); shift 2;;
+      --container) CONTAINER_COUNT=$(($CONTAINER_COUNT + 1)); DOCKER_RUN_COMMANDS+=("$2"); shift 2;;
       --revision) REVISION=("$2"); shift 2;;
       # Optional inputs
       --overwrite-ecr) OVERWRITE_ECR=true; shift 1;;

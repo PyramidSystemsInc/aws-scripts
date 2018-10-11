@@ -1,11 +1,13 @@
 
-1. Get multiple `--container` flags working
+1. Decouple cpu and memory requirements of different containers
 
-2. Better error messages
+2. Error out earlier if `docker run` commands are not valid 
 
-3. Validate Docker Hub images exist using `docker search`
+3. Better error messages
 
-4. Create scripts to destroy resources
+4. Validate Docker Hub images exist using `docker search`
 
-5. Clean output
+5. Create scripts to destroy resources
+
+6. Clean output
 
