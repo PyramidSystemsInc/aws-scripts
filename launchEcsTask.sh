@@ -94,7 +94,7 @@ function checkIfInstanceSuitsTask() {
 
 # Create an EC2 instance and register it with the cluster
 function createAndRegisterNewInstance() {
-  if [ "$INSTANCE_SUITS_TASK" == false ]; then
+  if [ "$INSTANCE_SUITS_TASK" == false ] || [ -z "$INSTANCE_SUITS_TASK"]; then
     getMinimumSuitableInstanceType
     getNewUniqueInstanceName
     createNewInstanceOpenPortSpec
@@ -252,7 +252,7 @@ function determineIfCreatingNewEc2Instance() {
   checkIfClusterActive
   if [ "$CLUSTER_ACTIVE" == true ]; then
     findExistingSuitableInstanceInCluster
-    if [ "$INSTANCE_SUITS_TASK" == false ]; then
+    if [ "$INSTANCE_SUITS_TASK" == false ] || [ -z "$INSTANCE_SUITS_TASK"]; then
       CREATING_NEW_EC2_INSTANCE=true
     else
       CREATING_NEW_EC2_INSTANCE=false
@@ -366,17 +366,21 @@ function findExistingSuitableInstanceInCluster() {
 
 # Having just created a new EC2 instance, query AWS for its ID and public IP
 function findNewInstanceInformation() {
-  EC2_INSTANCES=$(aws ec2 describe-instances --query 'Reservations[*].Instances[*].[State.Name,Tags[?Key==`Name`].Value,PublicIpAddress,InstanceId]')
-  INSTANCE_COUNT=$(echo $EC2_INSTANCES | jq '. | length')
-  for (( INSTANCE_INDEX=0; INSTANCE_INDEX<INSTANCE_COUNT; INSTANCE_INDEX++ )); do
-    THIS_INSTANCE=$(echo $EC2_INSTANCES | jq '.['"$INSTANCE_INDEX"'][0]')
-    THIS_INSTANCE_STATE=$(echo $THIS_INSTANCE | jq '.[0]')
-    THIS_INSTANCE_NAME=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo $THIS_INSTANCE | jq '.[1][0]'))
-    if [ "$THIS_INSTANCE_STATE" == \"running\" ] && [ "$THIS_INSTANCE_NAME" == "$NEW_INSTANCE_NAME" ]; then
-      THIS_INSTANCE_IP=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo $THIS_INSTANCE | jq '.[2]'))
-      THIS_INSTANCE_ID=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo $THIS_INSTANCE | jq '.[3]'))
-      break
-    fi
+  FAILED_QUERY_COUNT=0
+  while [ $FAILED_QUERY_COUNT -lt 3 ]; do
+    EC2_INSTANCES=$(aws ec2 describe-instances --query 'Reservations[*].Instances[*].[State.Name,Tags[?Key==`Name`].Value,PublicIpAddress,InstanceId]')
+    INSTANCE_COUNT=$(echo $EC2_INSTANCES | jq '. | length')
+    for (( INSTANCE_INDEX=0; INSTANCE_INDEX<INSTANCE_COUNT; INSTANCE_INDEX++ )); do
+      THIS_INSTANCE=$(echo $EC2_INSTANCES | jq '.['"$INSTANCE_INDEX"'][0]')
+      THIS_INSTANCE_STATE=$(echo $THIS_INSTANCE | jq '.[0]')
+      THIS_INSTANCE_NAME=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo $THIS_INSTANCE | jq '.[1][0]'))
+      if [ "$THIS_INSTANCE_STATE" == \"running\" ] && [ "$THIS_INSTANCE_NAME" == "$NEW_INSTANCE_NAME" ]; then
+        THIS_INSTANCE_IP=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo $THIS_INSTANCE | jq '.[2]'))
+        THIS_INSTANCE_ID=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo $THIS_INSTANCE | jq '.[3]'))
+        break 2
+      fi
+    done
+    FAILED_QUERY_COUNT=$(($FAILED_QUERY_COUNT + 1))
   done
   if [ -z "$THIS_INSTANCE_IP" ]; then
     echo -e "${COLOR_RED}"
@@ -416,14 +420,12 @@ function getEcrRepositoryUri() {
 function getMinimumSuitableInstanceType() {
   . ./util/awsT3InstanceSpecs.sh
   MINIMUM_SUITABLE_INSTANCE_TYPE=false
-  if [ "$INSTANCE_SUITS_TASK" == false ]; then
-    for AWS_T3_INSTANCE_SPEC in ${!AWS_T3_INSTANCE_SPEC@}; do
-      if [ ${AWS_T3_INSTANCE_SPEC[cpu]} -ge $CPU_REQUIREMENT ] && [ ${AWS_T3_INSTANCE_SPEC[memory]} -ge $MEMORY_REQUIREMENT ]; then
-        MINIMUM_SUITABLE_INSTANCE_TYPE=${AWS_T3_INSTANCE_SPEC[name]}
-        break
-      fi
-    done
-  fi
+  for AWS_T3_INSTANCE_SPEC in ${!AWS_T3_INSTANCE_SPEC@}; do
+    if [ ${AWS_T3_INSTANCE_SPEC[cpu]} -ge $CPU_REQUIREMENT ] && [ ${AWS_T3_INSTANCE_SPEC[memory]} -ge $MEMORY_REQUIREMENT ]; then
+      MINIMUM_SUITABLE_INSTANCE_TYPE=${AWS_T3_INSTANCE_SPEC[name]}
+      break
+    fi
+  done
 }
 
 # Get a unique name in the form of `ecs-<CLUSTER_NAME>-<UNIQUE_NUMBER>` which
@@ -647,19 +649,26 @@ function showHelp() {
     echo -e "Run a task on AWS ECS using the familiar syntax of Docker run commands"
     echo -e ""
     echo -e "Options:"
-    echo -e "      --cluster <string>                   Name of the ECS cluster you want to run your task on. If it does not exist, it will be created ${COLOR_GREEN}(required)${COLOR_NONE}"
-    echo -e "  -c, --container \"<docker_run_command>\"   Run command for a new container in ECS. Multiple container flags can be provided. Cannot be used along with the"
-    echo -e "                                             revision flag. A shortcut exists for referencing images from ECR. By prepending 'ecr/' to your image name, the"
-    echo -e "                                             'ecr' will expand at runtime to the full ECR URI. For more information on usage, run 'docker run --help'"
-    echo -e "  -h, --help                               Shows this block of text. Specifying the help flag will abort creation of AWS resources"
-    echo -e "  -o, --overwrite-ecr                      By default, this script will not allow you to overwrite ECR Docker images. If you are running a local image, it"
-    echo -e "                                             must be pushed to ECR before it can be run. Therefore, if you want to use a local image and that image exists in"
+    echo -e "      --cluster <string>                   Name of the ECS cluster you want to run your task on. If it does not exist, it"
+    echo -e "                                             will be created ${COLOR_GREEN}(required)${COLOR_NONE}"
+    echo -e "  -c, --container \"<docker_run_command>\"   Run command for a new container in ECS. Multiple container flags can be"
+    echo -e "                                             provided. Cannot be used along with the revision flag. A shortcut exists for"
+    echo -e "                                             referencing images from ECR. By prepending 'ecr/' to your image name, the"
+    echo -e "                                             'ecr' will expand at runtime to the full ECR URI. For more information on"
+    echo -e "                                             usage, run 'docker run --help'"
+    echo -e "  -h, --help                               Shows this block of text. Specifying the help flag will abort creation of AWS"
+    echo -e "                                             resources"
+    echo -e "  -o, --overwrite-ecr                      By default, this script will not allow you to overwrite ECR Docker images. If"
+    echo -e "                                             you are running a local image, it must be pushed to ECR before it can be"
+    echo -e "                                             run. Therefore, if you want to use a local image and that image exists in"
     echo -e "                                             ECR, you must add this flag to show you intended to overwrite the ECR image"
     echo -e "  -r, --region <string>                    AWS region where you want your ECS task to run. Defaults to 'us-east-2'"
-    echo -e "      --revision <number>                  Version number of an existing ECS task. By omitting the revision flag, it is assumed you want to run the latest"
-    echo -e "                                             version of the task. Cannot be used along with the container flag"
+    echo -e "      --revision <number>                  Version number of an existing ECS task. By omitting the revision flag, it is"
+    echo -e "                                             assumed you want to run the latest version of the task. Cannot be used along"
+    echo -e "                                             with the container flag"
     echo -e "  -s, --skip-output                        Suppress all output including errors"
-    echo -e "  -t, --task <string>                      Name of the task you want to run. If it does not exist, it will be created ${COLOR_GREEN}(required)${COLOR_NONE}"
+    echo -e "  -t, --task <string>                      Name of the task you want to run. If it does not exist, it will be created"
+    echo -e "                                             ${COLOR_GREEN}(required)${COLOR_NONE}"
     echo -e ""
     echo -e "Examples:"
     echo -e "$ ./launchEcsTask.sh --cluster sample --task important-thing --skip-output"
@@ -669,11 +678,15 @@ function showHelp() {
     echo -e "$ ./launchEcsTask.sh --cluster cluster --task task --revision 7 --region us-east-1"
     echo -e "    * Running a specific revision of an existing task in the Northern Virigina AWS region"
     echo -e ""
-    echo -e "$ ./launchEcsTask.sh --cluster project-name --task selenium --container \"docker run -p 4444:4444 --name selenium-hub selenium/hub:3.14.0-gallium\""
+    echo -e "$ ./launchEcsTask.sh --cluster project-name --task selenium \\"
+    echo -e "    --container \"docker run -p 4444:4444 --name selenium-hub selenium/hub:3.14.0-gallium\""
     echo -e "    * Running a new task with one container"
     echo -e ""
-    echo -e "$ ./launchEcsTask.sh --cluster dev --task whole-application -c \"docker run --name front -p 443:443 ecr/web\" -c \"docker run --name middle -p 8081:8081 ecr/services\" -c \"docker run --name db -p 5432:5432 mongo:dev\" --overwrite-ecr"
+    echo -e "$ ./launchEcsTask.sh --cluster dev --task whole-application -c \"docker run --name front -p 443:443 ecr/web\" \\"
+    echo -e "    -c \"docker run --name middle -p 8081:8081 ecr/services\" -c \"docker run --name back -p 5432:5432 mongo:dev\" \\"
+    echo -e "    --overwrite-ecr"
     echo -e "    * Running a new task with three containers"
+    echo -e "    * Two containers use existing images in ECR"
     echo -e "    * If 'mongo:dev' exists in ECR, it will be overwritten"
     echo -e ""
     echo -e "Having trouble?"
