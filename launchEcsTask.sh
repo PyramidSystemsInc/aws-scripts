@@ -676,7 +676,7 @@ function showHelp() {
     echo -e "    * Command will give zero output"
     echo -e ""
     echo -e "$ ./launchEcsTask.sh --cluster cluster --task task --revision 7 --region us-east-1"
-    echo -e "    * Running a specific revision of an existing task in the Northern Virigina AWS region"
+    echo -e "    * Running a specific revision of an existing task in the Northern Virginia AWS region"
     echo -e ""
     echo -e "$ ./launchEcsTask.sh --cluster project-name --task selenium \\"
     echo -e "    --container \"docker run -p 4444:4444 --name selenium-hub selenium/hub:3.14.0-gallium\""
