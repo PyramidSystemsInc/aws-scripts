@@ -40,6 +40,7 @@ function addParsedDockerRunToContainerDefinitions() {
   CONTAINER_DEFINITIONS[$CONTAINER_DEFINITION_COUNT,cpu]="$THIS_CPU"
   CONTAINER_DEFINITIONS[$CONTAINER_DEFINITION_COUNT,memory]="$THIS_MEMORY"
   CONTAINER_DEFINITIONS[$CONTAINER_DEFINITION_COUNT,port-mappings]="${THIS_PORT_MAPPINGS[@]}"
+  CONTAINER_DEFINITIONS[$CONTAINER_DEFINITION_COUNT,environment-variables]="${THIS_ENVIRONMENT_VARS[@]}"
 }
 
 # For an existing task defintion, query for the sum cpu, memory, and ports all its containers require to run
@@ -223,6 +224,51 @@ function createTaskDefinitionJson() {
       PORT_MAPPINGS_INDEX=$(($PORT_MAPPINGS_INDEX + 1))
     done
     if [ $PORT_MAPPINGS_INDEX -ge 1 ]; then
+			TASK_DEFINITION="$TASK_DEFINITION"$(cat <<-EOF
+
+					        }
+
+			EOF
+			)
+    fi
+		TASK_DEFINITION="$TASK_DEFINITION"$(cat <<-EOF
+
+			      ],
+			      "environment": [
+
+		EOF
+		)
+    ENVIRONMENT_VARIABLES=(${CONTAINER_DEFINITIONS[$CONTAINER_INDEX,environment-variables]})
+    ENVIRONMENT_VARIABLES_INDEX=0
+    for ENVIRONMENT_VARIABLE in "${ENVIRONMENT_VARIABLES[@]}"; do
+      if [ $ENVIRONMENT_VARIABLES_INDEX -eq 0 ]; then
+				TASK_DEFINITION="$TASK_DEFINITION"$(cat <<-EOF
+
+					        {
+
+				EOF
+				)
+      else
+				TASK_DEFINITION="$TASK_DEFINITION"$(cat <<-EOF
+
+					        },
+					        {
+
+				EOF
+				)
+      fi
+      VARIABLE_NAME=$(sed -e 's/=.*$//g' <<< $ENVIRONMENT_VARIABLE)
+      VARIABLE_VALUE=$(sed -e 's/^.*=//g' <<< $ENVIRONMENT_VARIABLE)
+			TASK_DEFINITION="$TASK_DEFINITION"$(cat <<-EOF
+
+				          "name": "$VARIABLE_NAME",
+				          "value": "$VARIABLE_VALUE"
+
+			EOF
+			)
+      ENVIRONMENT_VARIABLES_INDEX=$(($ENVIRONMENT_VARIABLES_INDEX + 1))
+    done
+    if [ $ENVIRONMENT_VARIABLES_INDEX -ge 1 ]; then
 			TASK_DEFINITION="$TASK_DEFINITION"$(cat <<-EOF
 
 					        }
@@ -592,6 +638,7 @@ function parseDockerRunCommand() {
   THIS_ARGS=()
   THIS_NAME=''
   THIS_IMAGE=()
+  THIS_ENVIRONMENT_VARS=()
   THIS_CPU=$DEFAULT_CPU
   THIS_MEMORY=$DEFAULT_MEMORY
   THIS_PORT_MAPPINGS=()
@@ -604,6 +651,8 @@ function parseDockerRunCommand() {
       --cpu) THIS_CPU=$(($2 * $CPU_COEF)); shift 2;;
       -m) THIS_MEMORY=$(echo "scale=0; (($2 * $MEMORY_COEF) / 1)" | bc); shift 2;;
       --memory) THIS_MEMORY=$(echo "scale=0; (($2 * $MEMORY_COEF) / 1)" | bc); shift 2;;
+      -e) THIS_ENVIRONMENT_VARS+=("$2"); shift 2;;
+      --env) THIS_ENVIRONMENT_VARS+=("$2"); shift 2;;
       docker) shift 1;;
       run) shift 1;;
       -*) echo "unknown option: $1" >&2; exit 1;;
