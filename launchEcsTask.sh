@@ -1,5 +1,24 @@
 #! /bin/bash
 
+function startMonitoringProgress() {
+  defineExpectedProgress
+  PROGRESS_FILE=$(mktemp /tmp/monitor-progress.XXXXXXX)
+  sudo chmod 775 "$PROGRESS_FILE"
+  trap 'stopMonitoringProgress; exit' SIGINT; ./util/monitorProgress.sh "$PROGRESS_FILE" "$EXPECTED_PROGRESS" & MONITOR_PROGRESS_PID=$!
+  echo "declare -A STEPS_COMPLETED" | sudo tee --append "$PROGRESS_FILE" >> /dev/null
+}
+
+function stopMonitoringProgress() {
+  sleep 2
+  STILL_MONITORING_PROGRESS=$(ps -a | grep $MONITOR_PROGRESS_PID)
+  if [ ! "$STILL_MONITORING_PROGRESS" == "" ]; then
+    kill $MONITOR_PROGRESS_PID >/dev/null 2>/dev/null
+  fi
+  if [ -f "$PROGRESS_FILE" ]; then
+    rm -Rf "$PROGRESS_FILE"
+  fi
+}
+
 # After parsing a `docker run` command, add to the container definitions associative array
 function addParsedDockerRunToContainerDefinitions() {
   if [ -n "$THIS_NAME" ]; then
@@ -92,15 +111,21 @@ function checkIfInstanceSuitsTask() {
   fi
 }
 
+function createUserDataScript() {
+  ./util/installEcsAgentOnEc2InstanceGenerator.sh "$CLUSTER_NAME"
+}
+
 # Create an EC2 instance and register it with the cluster
 function createAndRegisterNewInstance() {
   if [ "$INSTANCE_SUITS_TASK" == false ] || [ -z "$INSTANCE_SUITS_TASK"]; then
     getMinimumSuitableInstanceType
     getNewUniqueInstanceName
     createNewInstanceOpenPortSpec
+    createUserDataScript
     COMMAND="./createEc2Instance.sh --name "$NEW_INSTANCE_NAME" --image "$AWS_EC2_AMI" --type "$MINIMUM_SUITABLE_INSTANCE_TYPE" --iam-role jenkins_instance --port 22 "$NEW_INSTANCE_OPEN_PORTS_SPEC" --startup-script util/installEcsAgentOnEc2Instance.sh"
     $($COMMAND >> /dev/null)
     exitIfScriptFailed
+    echo "STEPS_COMPLETED[launch-ec2-instance]=true" | sudo tee --append "$PROGRESS_FILE" >> /dev/null
     findNewInstanceInformation
     waitUntilInstanceRegisteredInCluster
   fi
@@ -111,6 +136,7 @@ function createClusterIfDoesNotExist() {
   checkIfClusterActive
   if [ "$CLUSTER_ACTIVE" == false ]; then
     ./util/createEcsCluster.sh --name "$CLUSTER_NAME" --region "$AWS_REGION"
+    echo "STEPS_COMPLETED[create-cluster]=true" | sudo tee --append "$PROGRESS_FILE" >> /dev/null
   fi
 }
 
@@ -125,6 +151,7 @@ function createNewInstanceOpenPortSpec() {
   for PORT_MAPPING in "${PORT_MAPPINGS[@]}"; do
     NEW_INSTANCE_OPEN_PORTS_SPEC+="--port $(sed -e 's/:.*$//' <<< $PORT_MAPPING) "
   done
+  echo "STEPS_COMPLETED[create-port-spec]=true" | sudo tee --append "$PROGRESS_FILE" >> /dev/null
 }
 
 # Create a JSON structure for use in the AWS command `aws ecs register-task-definition`
@@ -218,6 +245,7 @@ function createTaskDefinitionJson() {
 		}
 	EOF
   )
+  echo "STEPS_COMPLETED[create-task-json]=true" | sudo tee --append "$PROGRESS_FILE" >> /dev/null
 }
 
 # Declare all constants for later use
@@ -252,7 +280,7 @@ function determineIfCreatingNewEc2Instance() {
   checkIfClusterActive
   if [ "$CLUSTER_ACTIVE" == true ]; then
     findExistingSuitableInstanceInCluster
-    if [ "$INSTANCE_SUITS_TASK" == false ] || [ -z "$INSTANCE_SUITS_TASK"]; then
+    if [ "$INSTANCE_SUITS_TASK" == false ] || [ -z "$INSTANCE_SUITS_TASK" ]; then
       CREATING_NEW_EC2_INSTANCE=true
     else
       CREATING_NEW_EC2_INSTANCE=false
@@ -383,6 +411,7 @@ function findNewInstanceInformation() {
     FAILED_QUERY_COUNT=$(($FAILED_QUERY_COUNT + 1))
   done
   if [ -z "$THIS_INSTANCE_IP" ]; then
+    echo "STEPS_COMPLETED[collect-new-instance-info]=false" | sudo tee --append "$PROGRESS_FILE" >> /dev/null
     echo -e "${COLOR_RED}"
     echo "ERROR: Something went wrong on our end. The (supposedly) newly created EC2 instance could not be found"
     echo -e "${COLOR_BLUE}"
@@ -392,6 +421,7 @@ function findNewInstanceInformation() {
   else
     NEW_INSTANCE_PUBLIC_IP=$THIS_INSTANCE_IP
     NEW_INSTANCE_ID=$THIS_INSTANCE_ID
+    echo "STEPS_COMPLETED[collect-new-instance-info]=true" | sudo tee --append "$PROGRESS_FILE" >> /dev/null
   fi
 }
 
@@ -423,6 +453,7 @@ function getMinimumSuitableInstanceType() {
   for AWS_T3_INSTANCE_SPEC in ${!AWS_T3_INSTANCE_SPEC@}; do
     if [ ${AWS_T3_INSTANCE_SPEC[cpu]} -ge $CPU_REQUIREMENT ] && [ ${AWS_T3_INSTANCE_SPEC[memory]} -ge $MEMORY_REQUIREMENT ]; then
       MINIMUM_SUITABLE_INSTANCE_TYPE=${AWS_T3_INSTANCE_SPEC[name]}
+      echo "STEPS_COMPLETED[determine-instance-type]=true" | sudo tee --append "$PROGRESS_FILE" >> /dev/null
       break
     fi
   done
@@ -459,6 +490,7 @@ function getNewUniqueInstanceName() {
     CANDIDATE_INDEX=$(($CANDIDATE_INDEX + 1))
   done
   NEW_INSTANCE_NAME="$INSTANCE_NAME_CANDIDATE"
+  echo "STEPS_COMPLETED[create-instance-name]=true" | sudo tee --append "$PROGRESS_FILE" >> /dev/null
 }
 
 # Handle user input
@@ -477,6 +509,7 @@ function launchTask() {
   else
     ECS_LAUNCH_STATUS=$(aws ecs run-task --cluster "$CLUSTER_NAME" --task-definition "$TASK_NAME":"$REVISION" --region "$AWS_REGION")
   fi
+  echo "STEPS_COMPLETED[launch-task]=true" | sudo tee --append "$PROGRESS_FILE" >> /dev/null
 }
 
 # Perform a `docker login` to ECR
@@ -500,6 +533,7 @@ function huntDownSecurityGroupOfTask() {
   EC2_ID_OF_TASK=$(sed -e 's/^"//' -e 's/"$//' <<< $(aws ecs describe-container-instances --cluster "$CLUSTER_NAME" --container-instances "$CONTAINER_INSTANCE_ID_OF_TASK" --region "$AWS_REGION" | jq '.containerInstances[0].ec2InstanceId'))
   CONTAINER_INSTANCE_TASK_COUNT=$(aws ecs describe-container-instances --cluster "$CLUSTER_NAME" --container-instances "$CONTAINER_INSTANCE_ID_OF_TASK" --region "$AWS_REGION" | jq '.containerInstances[0].runningTasksCount')
   SECURITY_GROUP_OF_TASK=$(sed -e 's/^"//' -e 's/"$//' <<< $(aws ec2 describe-instances --instance-ids "$EC2_ID_OF_TASK" | jq '.Reservations[0].Instances[0].NetworkInterfaces[0].Groups[0].GroupId'))
+  echo "STEPS_COMPLETED[find-security-group]=true" | sudo tee --append "$PROGRESS_FILE" >> /dev/null
 }
 
 # If a container instance is about to run a new task and has no tasks currently
@@ -517,6 +551,7 @@ function revokeAllSecurityRules() {
       done
     done
   fi
+  echo "STEPS_COMPLETED[revoke-port-permissions]=true" | sudo tee --append "$PROGRESS_FILE" >> /dev/null
 }
 
 # Authorize the necessary ports for an ECS task
@@ -531,6 +566,7 @@ function authorizeNecessarySecurityRulesForTask() {
       aws ec2 authorize-security-group-ingress --group-id "$SECURITY_GROUP_OF_TASK" --protocol tcp --port "$PORT_TO_AUTHORIZE" --cidr 0.0.0.0/0 --region "$AWS_REGION" 2>/dev/null
     done
   fi
+  echo "STEPS_COMPLETED[authorize-port-permissions]=true" | sudo tee --append "$PROGRESS_FILE" >> /dev/null
 }
 
 # Change the ingress port security rules for an existing container instance to match the requirements of the task running on it
@@ -624,6 +660,7 @@ function registerTaskDefinition() {
   validateDockerImages
   createTaskDefinitionJson
   aws ecs register-task-definition --cli-input-json "$TASK_DEFINITION" --region "$AWS_REGION" >> /dev/null
+  echo "STEPS_COMPLETED[register-task-definition]=true" | sudo tee --append "$PROGRESS_FILE" >> /dev/null
 }
 
 # Determine which "launch type" is required (based on the user input and the status of the cluster)
@@ -720,6 +757,7 @@ function validateDockerImages() {
     validateDockerImage
     IMAGE_INDEX=$((IMAGE_INDEX + 1))
   done
+  echo "STEPS_COMPLETED[validate-docker-images]=true" | sudo tee --append "$PROGRESS_FILE" >> /dev/null
 }
 
 # Validate a Docker image specified in a task definition or `docker run` command exists
@@ -806,8 +844,9 @@ function waitUntilInstanceRegisteredInCluster() {
     CLUSTER_INSTANCE_COUNT=$(echo $CLUSTER_INSTANCES | jq '. | length')
     for (( CLUSTER_INSTANCE_INDEX=0; CLUSTER_INSTANCE_INDEX<CLUSTER_INSTANCE_COUNT; CLUSTER_INSTANCE_INDEX++ )); do
       CLUSTER_INSTANCE_ID=$(sed -e 's/^.*\///' -e 's/"$//' <<< $(echo "$CLUSTER_INSTANCES" | jq '.['"$CLUSTER_INSTANCE_INDEX"']'))
-      CLUSTER_EC2_INSTANCE_ID=$(sed -e 's/^"//' -e 's/"$//' <<< $(aws ecs describe-container-instances --cluster sample --container-instances "$CLUSTER_INSTANCE_ID" | jq '.containerInstances[0].ec2InstanceId'))
+      CLUSTER_EC2_INSTANCE_ID=$(sed -e 's/^"//' -e 's/"$//' <<< $(aws ecs describe-container-instances --cluster "$CLUSTER_NAME" --container-instances "$CLUSTER_INSTANCE_ID" --region "$AWS_REGION" | jq '.containerInstances[0].ec2InstanceId'))
       if [ "$CLUSTER_EC2_INSTANCE_ID" == "$NEW_INSTANCE_ID" ]; then
+        echo "STEPS_COMPLETED[wait-until-instance-in-cluster]=true" | sudo tee --append "$PROGRESS_FILE" >> /dev/null
         break 2
       fi
     done
@@ -815,9 +854,127 @@ function waitUntilInstanceRegisteredInCluster() {
   done
 }
 
+# Create the configuration variable needed for the monitorProgress.sh script
+function defineExpectedProgress() {
+EXPECTED_PROGRESS=$(cat <<-EOF
+[
+
+EOF
+)
+  checkIfClusterActive
+  if [ "$CLUSTER_ACTIVE" == false ]; then
+EXPECTED_PROGRESS="$EXPECTED_PROGRESS"$(cat <<-EOF
+
+  {
+    "goal": "Creating ECS Cluster",
+    "steps": [
+      {
+        "label": "Creating cluster",
+        "variable": "create-cluster"
+      }
+    ]
+  },
+
+EOF
+)
+  fi
+  if [ "$LAUNCH_TYPE" == "new-everything" ] || [ "$LAUNCH_TYPE" == "new-instance" ]; then
+EXPECTED_PROGRESS="$EXPECTED_PROGRESS"$(cat <<-EOF
+
+  {
+    "goal": "Creating and Registering New EC2 Instance",
+    "steps": [
+      {
+        "label": "Finding the smallest suitable T3 instance type",
+        "variable": "determine-instance-type"
+      },
+      {
+        "label": "Creating unique instance name",
+        "variable": "create-instance-name"
+      },
+      {
+        "label": "Creating specifications for ports to be opened",
+        "variable": "create-port-spec"
+      },
+      {
+        "label": "Launching new EC2 instance",
+        "variable": "launch-ec2-instance"
+      },
+      {
+        "label": "Collecting information about the new instance",
+        "variable": "collect-new-instance-info"
+      },
+      {
+        "label": "Waiting until the new instance registers with the cluster",
+        "variable": "wait-until-instance-in-cluster"
+      }
+    ]
+  },
+
+EOF
+)
+  fi
+  if [ "$LAUNCH_TYPE" == "new-everything" ] || [ "$LAUNCH_TYPE" == "new-task-definition" ]; then
+EXPECTED_PROGRESS="$EXPECTED_PROGRESS"$(cat <<-EOF
+
+  {
+    "goal": "Registering New Task Definition",
+    "steps": [
+      {
+        "label": "Validating Docker images provided are valid",
+        "variable": "validate-docker-images"
+      },
+      {
+        "label": "Creating task definition JSON structure",
+        "variable": "create-task-json"
+      },
+      {
+        "label": "Registering task definition",
+        "variable": "register-task-definition"
+      }
+    ]
+  },
+
+EOF
+)
+  fi
+EXPECTED_PROGRESS="$EXPECTED_PROGRESS"$(cat <<-EOF
+
+  {
+    "goal": "Launching ECS Task",
+    "steps": [
+      {
+        "label": "Launching task",
+        "variable": "launch-task"
+      }
+    ]
+  },
+  {
+    "goal": "Editing Security Rules",
+    "steps": [
+      {
+        "label": "Finding the security group of the container instance",
+        "variable": "find-security-group"
+      },
+      {
+        "label": "Revoking all port permissions",
+        "variable": "revoke-port-permissions"
+      },
+      {
+        "label": "Authorizing necessary port permissions",
+        "variable": "authorize-port-permissions"
+      }
+    ]
+  }
+]
+EOF
+)
+}
+
 declareConstants
 handleInput "$@"
 determineLaunchType
+startMonitoringProgress
 createClusterIfDoesNotExist
 if [ "$LAUNCH_TYPE" == "new-everything" ]; then
   createAndRegisterNewInstance
@@ -833,3 +990,4 @@ else
 fi
 launchTask
 editSecurityRulesForContainerPorts
+stopMonitoringProgress

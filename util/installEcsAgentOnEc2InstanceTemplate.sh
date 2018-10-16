@@ -1,7 +1,3 @@
-#! /bin/bash
-
-CLUSTER_NAME=sample
-
 sudo yum update -y
 sudo mkdir /etc/ecs
 sudo touch /etc/ecs/ecs.config

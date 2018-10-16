@@ -3,7 +3,6 @@
 # Create ECS cluster
 function createCluster() {
   aws ecs create-cluster --cluster-name "$CLUSTER_NAME" --region "$AWS_REGION" >> /dev/null
-  echo "STEPS_COMPLETED[1]=true" | sudo tee --append /configurationProgress.sh >> /dev/null
 }
 
 # Define all colors used for output
@@ -11,17 +10,6 @@ function defineColorPalette() {
   COLOR_RED='\033[0;91m'
   COLOR_WHITE_BOLD='\033[1;97m'
   COLOR_NONE='\033[0m'
-}
-
-# Create the configuration variable needed for the monitorProgress.sh script
-function defineExpectedProgress() {
-	EXPECTED_PROGRESS=$(cat <<-EOF
-		[
-		  "Creating ECS Cluster",
-		  "Creating ECS Cluster"
-		]
-	EOF
-	)
 }
 
 # Handle user input
@@ -48,8 +36,4 @@ function handleInput() {
 
 handleInput "$@"
 defineColorPalette
-defineExpectedProgress
-trap 'kill $MONITOR_PROGRESS_PID; exit' SIGINT; ./util/monitorProgress.sh "$EXPECTED_PROGRESS" & MONITOR_PROGRESS_PID=$!
 createCluster
-sleep 3; if pgrep $MONITOR_PROGRESS_PID; then pkill $MONITOR_PROGRESS_PID; fi
-echo -e ""

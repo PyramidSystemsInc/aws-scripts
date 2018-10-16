@@ -1,5 +1,24 @@
 #! /bin/bash
 
+function startMonitoringProgress() {
+  defineExpectedProgress
+  PROGRESS_FILE=$(mktemp /tmp/monitor-progress.XXXXXXX)
+  sudo chmod 775 "$PROGRESS_FILE"
+  trap 'stopMonitoringProgress; exit' SIGINT; ./util/monitorProgress.sh "$PROGRESS_FILE" "$EXPECTED_PROGRESS" & MONITOR_PROGRESS_PID=$!
+  echo "declare -A STEPS_COMPLETED" | sudo tee --append "$PROGRESS_FILE" >> /dev/null
+}
+
+function stopMonitoringProgress() {
+  sleep 2
+  STILL_MONITORING_PROGRESS=$(ps -a | grep $MONITOR_PROGRESS_PID)
+  if [ ! "$STILL_MONITORING_PROGRESS" == "" ]; then
+    kill $MONITOR_PROGRESS_PID >/dev/null 2>/dev/null
+  fi
+  if [ -f "$PROGRESS_FILE" ]; then
+    rm -Rf "$PROGRESS_FILE"
+  fi
+}
+
 # Declare defaults for optional input values / flags
 function declareInputDefaults() {
   AWS_REGION="us-east-2"
@@ -90,6 +109,7 @@ function terminateEc2Instances() {
 # Delete the ECS cluster
 function deleteEcsCluster() {
   DELETE_CLUSTER=$(aws ecs delete-cluster --cluster "$CLUSTER_NAME" --region "$AWS_REGION")
+  echo "STEPS_COMPLETED[delete-cluster]=true" | sudo tee --append "$PROGRESS_FILE" >> /dev/null
 }
 
 # Get all the EC2 instance IDs of the container instances in the ECS cluster specified
@@ -103,6 +123,7 @@ function getEc2InstanceIdsInCluster() {
       EC2_INSTANCE_IDS+=($(sed -e 's/^"//' -e 's/"$//' <<< $(echo "$CONTAINER_INSTANCE_DESCRIPTIONS" | jq '.['"$DESCRIPTION_INDEX"']')))
     done
   fi
+  echo "STEPS_COMPLETED[get-instance-ids]=true" | sudo tee --append "$PROGRESS_FILE" >> /dev/null
 }
 
 # Get the ECS container instance IDs in the cluster
@@ -114,6 +135,7 @@ function getContainerInstanceIdsInCluster() {
     THIS_CONTAINER_INSTANCE=$(sed -e 's/^.*\///' -e 's/"$//' <<< $(echo "$CONTAINER_INSTANCES" | jq '.['"$CONTAINER_INSTANCE_INDEX"']'))
     CONTAINER_INSTANCE_IDS+=("$THIS_CONTAINER_INSTANCE")
   done
+  echo "STEPS_COMPLETED[launch-ec2-instance]=true" | sudo tee --append "$PROGRESS_FILE" >> /dev/null
 }
 
 # If instances exist in the cluster specified, send the order to start terminating all of them
@@ -121,6 +143,7 @@ function sendTerminateOrderToEc2Instances() {
   if [ "${#EC2_INSTANCE_IDS[@]}" -gt 0 ]; then
     TERMINATION_ORDER=$(aws ec2 terminate-instances --instance-ids "${EC2_INSTANCE_IDS[@]}" --region "$AWS_REGION")
   fi
+  echo "STEPS_COMPLETED[send-terminate-order]=true" | sudo tee --append "$PROGRESS_FILE" >> /dev/null
 }
 
 # Wait until all the EC2 instances are finished shutting down
@@ -140,12 +163,14 @@ function waitUntilEc2InstancesTerminated() {
       sleep 2
     fi
   done
+  echo "STEPS_COMPLETED[wait-for-termination]=true" | sudo tee --append "$PROGRESS_FILE" >> /dev/null
 }
 
 # Get all the IDs of the EC2 resources used by the cluster
 function getEc2ResourcesInCluster() {
   getEc2InstanceIdsInCluster
   EC2_RESOURCES=$(aws ec2 describe-instances --instance-ids "${EC2_INSTANCE_IDS[@]}" --query 'Reservations[*].Instances[*].[KeyName,SecurityGroups[0].GroupId]' --region "$AWS_REGION" | jq '.')
+  echo "STEPS_COMPLETED[get-resources]=true" | sudo tee --append "$PROGRESS_FILE" >> /dev/null
 }
 
 # Delete the resources that are used only by the recently terminated EC2 instances
@@ -183,6 +208,7 @@ function deleteClusterKeyPairsNotInUse() {
       aws ec2 delete-key-pair --key-name "$KEY_PAIR" --region "$AWS_REGION"
     fi
   done
+  echo "STEPS_COMPLETED[delete-key-pairs]=true" | sudo tee --append "$PROGRESS_FILE" >> /dev/null
 }
 
 # Delete all security groups that were (1) used by the instances in the cluster and (2) are not still in use
@@ -202,11 +228,71 @@ function deleteClusterSecurityGroupsNotInUse() {
       aws ec2 delete-security-group --group-id "$SECURITY_GROUP" --region "$AWS_REGION"
     fi
   done
+  echo "STEPS_COMPLETED[delete-security-groups]=true" | sudo tee --append "$PROGRESS_FILE" >> /dev/null
+}
+
+# Create the configuration variable needed for the monitorProgress.sh script
+function defineExpectedProgress() {
+EXPECTED_PROGRESS=$(cat <<-EOF
+[
+  {
+    "goal": "Taking Stock of Resources in Cluster",
+    "steps": [
+      {
+        "label": "Getting EC2 instance IDs in the cluster",
+        "variable": "get-instance-ids"
+      },
+      {
+        "label": "Getting key pairs and security groups in the cluster",
+        "variable": "get-resources"
+      }
+    ]
+  },
+  {
+    "goal": "Terminating EC2 Instances",
+    "steps": [
+      {
+        "label": "Send order to terminate all instances in cluster",
+        "variable": "send-terminate-order"
+      },
+      {
+        "label": "Waiting for instances to terminate",
+        "variable": "wait-for-termination"
+      }
+    ]
+  },
+  {
+    "goal": "Deleting Other EC2 Resources",
+    "steps": [
+      {
+        "label": "Deleting key pairs from the cluster that are no longer in use",
+        "variable": "delete-key-pairs"
+      },
+      {
+        "label": "Deleting security groups from the cluster that are no longer in use",
+        "variable": "delete-security-groups"
+      }
+    ]
+  },
+  {
+    "goal": "Deleting Cluster",
+    "steps": [
+      {
+        "label": "Deleting cluster",
+        "variable": "delete-cluster"
+      }
+    ]
+  }
+]
+EOF
+)
 }
 
 defineColorPalette
 handleInput "$@"
+startMonitoringProgress
 getEc2ResourcesInCluster
 terminateEc2Instances
 deleteEc2Resources
 deleteEcsCluster
+stopMonitoringProgress

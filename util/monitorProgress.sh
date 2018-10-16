@@ -1,10 +1,69 @@
 #! /bin/bash
 
-# Clean up the configuration progress file
-function cleanup() {
-  if [ -f /configurationProgress.sh ]; then
-    sudo rm /configurationProgress.sh
-  fi
+function handleInput() {
+  PROGRESS_FILE="$1"
+  EXPECTED_PROGRESS=$2
+  GOAL_COUNT=$(echo "$EXPECTED_PROGRESS" | jq '. | length')
+  GOAL_INDEX=0
+}
+
+function monitorNewGoal() {
+  THIS_GOAL=$(echo "$EXPECTED_PROGRESS" | jq '.['"$GOAL_INDEX"']')
+  GOAL_TITLE=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo "$THIS_GOAL" | jq '.goal'))
+  STEP_COUNT=$(echo "$THIS_GOAL" | jq '.steps | length')
+  STEPS=()
+  for (( STEP_INDEX=0; STEP_INDEX<STEP_COUNT; STEP_INDEX++ )); do
+    STEPS+=("$(sed -e 's/^"//' -e 's/"$//' <<< $(echo "$THIS_GOAL" | jq '.steps['"$STEP_INDEX"']'))")
+  done
+  echo -e ""
+  ELLIPSIS=""
+  for (( LINE_INDEX=0; LINE_INDEX<STEP_COUNT; LINE_INDEX++ )) do
+    echo -e ""
+  done
+  while : ; do
+    STEPS_COMPLETED=()
+    . "$PROGRESS_FILE"
+    ELLIPSIS+="."
+    LINE_COUNT=$(($STEP_COUNT + 1))
+    echo -en "\e[${LINE_COUNT}A"
+    # CHECK HERE IF ALL STEPS IN THIS GOAL ARE COMPLETED
+    ALL_STEPS_COMPLETED=true
+    ALL_STEPS_SUCCESSFUL=true
+    for (( STEP_INDEX=0; STEP_INDEX<STEP_COUNT; STEP_INDEX++ )); do
+      THIS_STEP=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo "$THIS_GOAL" | jq '.steps['"$STEP_INDEX"'].variable'))
+      if [ "${STEPS_COMPLETED["$THIS_STEP"]}" != "true" ]; then
+        ALL_STEPS_SUCCESSFUL=false
+      fi
+      if [ -z "${STEPS_COMPLETED["$THIS_STEP"]}" ]; then
+        ALL_STEPS_COMPLETED=false
+      fi
+    done
+    if [ "$ALL_STEPS_COMPLETED" == "true" ]; then
+      if [ "$ALL_STEPS_SUCCESSFUL" == "true" ]; then
+        echo -e "${COLOR_GREEN_BOLD}[ ${CHECK_MARK} DONE ]${COLOR_WHITE_BOLD} ($((GOAL_INDEX + 1))/$GOAL_COUNT) $GOAL_TITLE          "
+      else
+        echo -e "${COLOR_RED_BOLD}[ SKIPPED ]${COLOR_WHITE_BOLD} ($((GOAL_INDEX + 1))/$GOAL_COUNT) $GOAL_TITLE           "
+      fi
+    else
+      if [ ${#ELLIPSIS} -gt 3 ]; then
+        echo -e "${COLOR_BLUE_BOLD}[ IN PROGRESS ]${COLOR_WHITE_BOLD} ($((GOAL_INDEX + 1))/$GOAL_COUNT) $GOAL_TITLE   "
+        ELLIPSIS=""
+      else
+        echo -e "${COLOR_BLUE_BOLD}[ IN PROGRESS ]${COLOR_WHITE_BOLD} ($((GOAL_INDEX + 1))/$GOAL_COUNT) $GOAL_TITLE$ELLIPSIS"
+      fi
+    fi
+    for STEP in "${STEPS[@]}"; do
+      STEP_LABEL=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo "$STEP" | jq '.label'))
+      STEP_VARIABLE=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo "$STEP" | jq '.variable'))
+      echo -e "    ${COLOR_NONE}- [$([ -n "${STEPS_COMPLETED[$STEP_VARIABLE]}" ] && "${STEPS_COMPLETED[$STEP_VARIABLE]}" == "true" && echo "X" || echo " ")] "$STEP_LABEL""
+    done
+    sleep 0.75
+    if [ "$ALL_STEPS_COMPLETED" == "true" ]; then
+      break
+    fi
+  done
+  ((GOAL_INDEX++))
+  echo -e ""
 }
 
 # Define all colors used for output
@@ -21,72 +80,14 @@ function defineSpecialCharacters() {
   CHECK_MARK='\xE2\x9C\x94'
 }
 
-# Create a configuration progress file in case it does not already exist
-function ensureConfigurationProgressFile() {
-  if [ -f /configurationProgress.sh ]; then
-    sudo rm /configurationProgress.sh
-  fi
-  sudo touch /configurationProgress.sh
-  sudo chmod 755 /configurationProgress.sh
+function defineConstants() {
+  defineColorPalette
+  defineSpecialCharacters
 }
 
-# Show readable output based on input JSON
-function monitorProgress() {
-  echo -e ""
-  ELLIPSIS=""
-  for (( LINE_INDEX=0; LINE_INDEX<STEP_COUNT; LINE_INDEX++ )) do
-    echo -e ""
-  done
-  while : ; do
-    . /configurationProgress.sh
-    ELLIPSIS+="."
-    echo -en "\e[${STEP_COUNT}A"
-    if [ ${#STEPS_COMPLETED[@]} -eq $SUB_STEP_COUNT ]; then
-      ALL_STEPS_SUCCESSFUL=true
-      for (( STEP_COMPLETED_INDEX=1; STEP_COMPLETED_INDEX<STEP_COUNT; STEP_COMPLETED_INDEX++ )) do
-        if [ ${STEPS_COMPLETED[$STEP_COMPLETED_INDEX]} != "true" ]; then
-          ALL_STEPS_SUCCESSFUL=false
-        fi
-      done
-      if [ "$ALL_STEPS_SUCCESSFUL" == "true" ]; then
-        echo -e "${COLOR_GREEN_BOLD}[ ${CHECK_MARK} DONE ]${COLOR_WHITE_BOLD} $JOB_LABEL          "
-      else
-        echo -e "${COLOR_RED_BOLD}[ SKIPPED ]${COLOR_WHITE_BOLD} $JOB_LABEL           "
-      fi
-    else
-      if [ ${#ELLIPSIS} -gt 3 ]; then
-        echo -e "${COLOR_BLUE_BOLD}[ IN PROGRESS ]${COLOR_WHITE_BOLD} $JOB_LABEL   "
-        ELLIPSIS=""
-      else
-        echo -e "${COLOR_BLUE_BOLD}[ IN PROGRESS ]${COLOR_WHITE_BOLD} $JOB_LABEL$ELLIPSIS"
-      fi
-    fi
-    INDEX=1
-    for STEP_LABEL in "${STEP_LABELS[@]}"; do
-      echo -e "    ${COLOR_NONE}- [$([ -n "${STEPS_COMPLETED["$INDEX"]}" ] && "${STEPS_COMPLETED["$INDEX"]}" == "true" && echo "X" || echo " ")] "$STEP_LABEL""
-      ((INDEX++))
-    done
-    sleep 0.75
-    if [ ${#STEPS_COMPLETED[@]} -eq $SUB_STEP_COUNT ]; then
-      break
-    fi
-  done
-}
-
-function readExpectedProgressInput() {
-  RAW_STEPS=$1
-  JOB_LABEL=$(sed -e 's/^"//' -e 's/"$//' <<< $(echo "$RAW_STEPS" | jq '.[0]'))
-  STEP_LABELS=()
-  STEP_COUNT=$(echo "$RAW_STEPS" | jq '. | length')
-  SUB_STEP_COUNT=$(($STEP_COUNT - 1))
-  for (( STEP_INDEX=1; STEP_INDEX<STEP_COUNT; STEP_INDEX++ )) do
-    STEP_LABELS+=("$(sed -e 's/^"//' -e 's/"$//' <<< $(echo "$RAW_STEPS" | jq '.['"$STEP_INDEX"']'))")
-  done
-}
-
-ensureConfigurationProgressFile
-readExpectedProgressInput "$@"
-defineColorPalette
-defineSpecialCharacters
-monitorProgress
-cleanup
+echo -e ""
+defineConstants
+handleInput "$@"
+while [ "$GOAL_INDEX" -lt "$GOAL_COUNT" ]; do
+  monitorNewGoal
+done
