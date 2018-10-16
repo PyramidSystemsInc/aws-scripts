@@ -442,7 +442,7 @@ function findExistingSuitableInstanceInCluster() {
 function findNewInstanceInformation() {
   FAILED_QUERY_COUNT=0
   while [ $FAILED_QUERY_COUNT -lt 3 ]; do
-    EC2_INSTANCES=$(aws ec2 describe-instances --query 'Reservations[*].Instances[*].[State.Name,Tags[?Key==`Name`].Value,PublicIpAddress,InstanceId]')
+    EC2_INSTANCES=$(aws ec2 describe-instances --query 'Reservations[*].Instances[*].[State.Name,Tags[?Key==`Name`].Value,PublicIpAddress,InstanceId]' --region "$AWS_REGION")
     INSTANCE_COUNT=$(echo $EC2_INSTANCES | jq '. | length')
     for (( INSTANCE_INDEX=0; INSTANCE_INDEX<INSTANCE_COUNT; INSTANCE_INDEX++ )); do
       THIS_INSTANCE=$(echo $EC2_INSTANCES | jq '.['"$INSTANCE_INDEX"'][0]')
@@ -508,7 +508,7 @@ function getMinimumSuitableInstanceType() {
 # Get a unique name in the form of `ecs-<CLUSTER_NAME>-<UNIQUE_NUMBER>` which
 # does not conflict with any existing EC2 key pair or EC2 security group names
 function getNewUniqueInstanceName() {
-  CLUSTER_STATUS=$(aws ecs describe-clusters --clusters "$CLUSTER_NAME" | jq '.clusters[0]')
+  CLUSTER_STATUS=$(aws ecs describe-clusters --clusters "$CLUSTER_NAME" --region "$AWS_REGION" | jq '.clusters[0]')
   CLUSTER_INSTANCE_COUNT=$(echo "$CLUSTER_STATUS" | jq '.registeredContainerInstancesCount')
   CANDIDATE_INDEX=$(($CLUSTER_INSTANCE_COUNT + 1))
   KEY_PAIRS=$(aws ec2 describe-key-pairs --region "$AWS_REGION" | jq '.KeyPairs')
@@ -578,7 +578,7 @@ function huntDownSecurityGroupOfTask() {
   CONTAINER_INSTANCE_ID_OF_TASK=$(sed -e 's/^.*\///' -e 's/"$//' <<< $(echo "$CONTAINER_INSTANCE_ARN_OF_TASK"))
   EC2_ID_OF_TASK=$(sed -e 's/^"//' -e 's/"$//' <<< $(aws ecs describe-container-instances --cluster "$CLUSTER_NAME" --container-instances "$CONTAINER_INSTANCE_ID_OF_TASK" --region "$AWS_REGION" | jq '.containerInstances[0].ec2InstanceId'))
   CONTAINER_INSTANCE_TASK_COUNT=$(aws ecs describe-container-instances --cluster "$CLUSTER_NAME" --container-instances "$CONTAINER_INSTANCE_ID_OF_TASK" --region "$AWS_REGION" | jq '.containerInstances[0].runningTasksCount')
-  SECURITY_GROUP_OF_TASK=$(sed -e 's/^"//' -e 's/"$//' <<< $(aws ec2 describe-instances --instance-ids "$EC2_ID_OF_TASK" | jq '.Reservations[0].Instances[0].NetworkInterfaces[0].Groups[0].GroupId'))
+  SECURITY_GROUP_OF_TASK=$(sed -e 's/^"//' -e 's/"$//' <<< $(aws ec2 describe-instances --instance-ids "$EC2_ID_OF_TASK" --region "$AWS_REGION" | jq '.Reservations[0].Instances[0].NetworkInterfaces[0].Groups[0].GroupId'))
   echo "STEPS_COMPLETED[find-security-group]=true" | sudo tee --append "$PROGRESS_FILE" >> /dev/null
 }
 
