@@ -496,12 +496,14 @@ function getEcrRepositoryUri() {
 function getMinimumSuitableInstanceType() {
   . ./util/awsT3InstanceSpecs.sh
   MINIMUM_SUITABLE_INSTANCE_TYPE=false
-  for AWS_T3_INSTANCE_SPEC in ${!AWS_T3_INSTANCE_SPEC@}; do
-    if [ ${AWS_T3_INSTANCE_SPEC[cpu]} -ge $CPU_REQUIREMENT ] && [ ${AWS_T3_INSTANCE_SPEC[memory]} -ge $MEMORY_REQUIREMENT ]; then
-      MINIMUM_SUITABLE_INSTANCE_TYPE=${AWS_T3_INSTANCE_SPEC[name]}
+  INSTANCE_SPEC_INDEX=0
+  while [ $INSTANCE_SPEC_INDEX -lt $INSTANCE_SPEC_COUNT ]; do
+    if [ ${AWS_T3_INSTANCE_SPECS[$INSTANCE_SPEC_INDEX,cpu]} -ge $CPU_REQUIREMENT ] && [ ${AWS_T3_INSTANCE_SPECS[$INSTANCE_SPEC_INDEX,memory]} -ge $MEMORY_REQUIREMENT ]; then
+      MINIMUM_SUITABLE_INSTANCE_TYPE=${AWS_T3_INSTANCE_SPECS[$INSTANCE_SPEC_INDEX,name]}
       echo "STEPS_COMPLETED[determine-instance-type]=true" | sudo tee --append "$PROGRESS_FILE" >> /dev/null
       break
     fi
+    ((INSTANCE_SPEC_INDEX++))
   done
 }
 
