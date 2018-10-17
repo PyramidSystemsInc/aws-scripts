@@ -124,6 +124,9 @@ function createAndRegisterNewInstance() {
     createNewInstanceOpenPortSpec
     createUserDataScript
     COMMAND="./createEc2Instance.sh --name "$NEW_INSTANCE_NAME" --image "$AWS_EC2_AMI" --type "$MINIMUM_SUITABLE_INSTANCE_TYPE" --iam-role jenkins_instance --port 22 "$NEW_INSTANCE_OPEN_PORTS_SPEC" --startup-script util/installEcsAgentOnEc2Instance.sh"
+    if [ "$USE_EXISTING_KEY_PAIR" == "true" ]; then
+      COMMAND+=" --key-pair $EXISTING_KEY_PAIR"
+    fi
     $($COMMAND >> /dev/null)
     exitIfScriptFailed
     echo "STEPS_COMPLETED[launch-ec2-instance]=true" | sudo tee --append "$PROGRESS_FILE" >> /dev/null
@@ -683,6 +686,10 @@ function parseInputFlags() {
       --container) CONTAINER_COUNT=$(($CONTAINER_COUNT + 1)); DOCKER_RUN_COMMANDS+=("$2"); shift 2;;
       --revision) REVISION=("$2"); shift 2;;
       # Optional inputs
+      -h) HELP_WANTED=true; shift 1;;
+      --help) HELP_WANTED=true; shift 1;;
+      -k) USE_EXISTING_KEY_PAIR=true; EXISTING_KEY_PAIR="$2"; shift 2;;
+      --key-pair) USE_EXISTING_KEY_PAIR=true; EXISTING_KEY_PAIR="$2"; shift 2;;
       -o) OVERWRITE_ECR=true; shift 1;;
       --overwrite-ecr) OVERWRITE_ECR=true; shift 1;;
       -r) AWS_REGION="$2"; shift 2;;
@@ -690,8 +697,6 @@ function parseInputFlags() {
       # Optional inputs yet to be implemented
       -s) NO_OUTPUT=true; shift 1;;
       --skip-output) NO_OUTPUT=true; shift 1;;
-      -h) HELP_WANTED=true; shift 1;;
-      --help) HELP_WANTED=true; shift 1;;
       -*) echo "unknown option: $1" >&2; exit 1;;
       *) ARGS+="$1 "; shift 1;;
     esac
