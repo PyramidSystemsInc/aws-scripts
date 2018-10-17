@@ -8,7 +8,7 @@ function changeInstanceName() {
 
 # Create EC2 instance
 function createInstance() {
-  COMMAND="aws ec2 run-instances --region "$AWS_REGION" --image-id "$AWS_IMAGE_AMI" --count "$COUNT" --instance-type "$AWS_INSTANCE_TYPE" --key-name "$INSTANCE_NAME" --security-group-ids "$SECURITY_GROUP_ID""
+  COMMAND="aws ec2 run-instances --region "$AWS_REGION" --image-id "$AWS_IMAGE_AMI" --count "$COUNT" --instance-type "$AWS_INSTANCE_TYPE" --security-group-ids "$SECURITY_GROUP_ID""
   if [ -n "$AWS_IAM_ROLE" ]; then
     COMMAND+=" --iam-instance-profile Name="$AWS_IAM_ROLE""
   fi
@@ -18,27 +18,36 @@ function createInstance() {
   if [ -n "$STARTUP_SCRIPT" ]; then
     COMMAND+=" --user-data file://$STARTUP_SCRIPT"
   fi
+  if [ "$USE_EXISTING_KEY_PAIR" == "true" ]; then
+    COMMAND+=" --key-name $EXISTING_KEY_PAIR"
+  else
+    COMMAND+=" --key-name $INSTANCE_NAME"
+  fi
   INSTANCE_ID=$(sed -e 's/^"//' -e 's/"$//' <<< $($COMMAND | jq '.Instances[0].InstanceId'))
   echo "STEPS_COMPLETED[3]=true" | sudo tee --append /configurationProgress.sh >> /dev/null
 }
 
 # Create key pair
-function createKeyPair() {
-  if [ -f "$KEY_PAIR_DIR""$INSTANCE_NAME".pem ]; then
-    sudo rm "$KEY_PAIR_DIR""$INSTANCE_NAME".pem
-  fi
-  aws ec2 create-key-pair --region $AWS_REGION --key-name "$INSTANCE_NAME" --query 'KeyMaterial' --output text > "$KEY_PAIR_DIR""$INSTANCE_NAME".pem
-  KEY_PAIR=$(cat "$KEY_PAIR_DIR""$INSTANCE_NAME".pem)
-  if [ ${#KEY_PAIR} == 0 ]; then
-    echo -e ""
-    echo -e "${COLOR_RED}ERROR: PEM file was unable to be created. Do you have permissions on your AWS account to create key pairs?"
-    echo -e "${COLOR_NONE}"
-    if pgrep $MONITOR_PROGRESS_PID; then pkill $MONITOR_PROGRESS_PID; fi
-    exit 2
+function createKeyPairIfNeeded() {
+  if [ "$USE_EXISTING_KEY_PAIR" == "false" ]; then
+    if [ -f "$KEY_PAIR_DIR""$INSTANCE_NAME".pem ]; then
+      sudo rm "$KEY_PAIR_DIR""$INSTANCE_NAME".pem
+    fi
+    aws ec2 create-key-pair --region $AWS_REGION --key-name "$INSTANCE_NAME" --query 'KeyMaterial' --output text > "$KEY_PAIR_DIR""$INSTANCE_NAME".pem
+    KEY_PAIR=$(cat "$KEY_PAIR_DIR""$INSTANCE_NAME".pem)
+    if [ ${#KEY_PAIR} == 0 ]; then
+      echo -e ""
+      echo -e "${COLOR_RED}ERROR: PEM file was unable to be created. Do you have permissions on your AWS account to create key pairs?"
+      echo -e "${COLOR_NONE}"
+      if pgrep $MONITOR_PROGRESS_PID; then pkill $MONITOR_PROGRESS_PID; fi
+      exit 2
+    else
+      chmod 400 "$KEY_PAIR_DIR""$INSTANCE_NAME".pem
+    fi
+    echo "STEPS_COMPLETED[2]=true" | sudo tee --append /configurationProgress.sh >> /dev/null
   else
-    chmod 400 "$KEY_PAIR_DIR""$INSTANCE_NAME".pem
+    echo "STEPS_COMPLETED[2]=false" | sudo tee --append /configurationProgress.sh >> /dev/null
   fi
-  echo "STEPS_COMPLETED[2]=true" | sudo tee --append /configurationProgress.sh >> /dev/null
 }
 
 # Create security group
@@ -94,6 +103,7 @@ function handleInput() {
   TAG_NAMES=()
   TAG_VALUES=()
   WAIT_FOR_INITIALIZATION=false
+  USE_EXISTING_KEY_PAIR=false
   while [ "$#" -gt 0 ]; do
     case "$1" in
       # Required inputs
@@ -103,6 +113,7 @@ function handleInput() {
       # Optional inputs
       --iam-role) AWS_IAM_ROLE="$2"; shift 2;;
       --key-pair-dir) KEY_PAIR_DIR="$2"; shift 2;;
+      --key-pair) USE_EXISTING_KEY_PAIR=true; EXISTING_KEY_PAIR="$2"; shift 2;;
       --port) PORTS+=("$2"); shift 2;;
       --region) AWS_REGION="$2"; shift 2;;
       --startup-script) STARTUP_SCRIPT="$2"; shift 2;;
@@ -163,7 +174,7 @@ defineColorPalette
 #defineExpectedProgress
 #trap 'kill $MONITOR_PROGRESS_PID; exit' SIGINT; ./util/monitorProgress.sh "$EXPECTED_PROGRESS" & MONITOR_PROGRESS_PID=$!
 createSecurityGroup
-createKeyPair
+createKeyPairIfNeeded
 createInstance
 changeInstanceName
 waitUntilInstanceRunning
