@@ -1030,7 +1030,7 @@ EOF
 declareConstants
 handleInput "$@"
 determineLaunchType
-startMonitoringProgress
+# startMonitoringProgress
 createClusterIfDoesNotExist
 if [ "$LAUNCH_TYPE" == "new-everything" ]; then
   createAndRegisterNewInstance
@@ -1046,4 +1046,4 @@ else
 fi
 launchTask
 editSecurityRulesForContainerPorts
-stopMonitoringProgress
+# stopMonitoringProgress
